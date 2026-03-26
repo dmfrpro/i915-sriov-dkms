@@ -4,6 +4,7 @@
  */
 
 #include <linux/string_choices.h>
+#include <linux/vmalloc.h>
 #include <linux/wordpart.h>
 
 #include "abi/guc_actions_sriov_abi.h"
@@ -534,6 +535,10 @@ static int pf_provision_vf_ggtt(struct xe_gt *gt, unsigned int vfid, u64 size)
 	node = xe_ggtt_insert_node(ggtt, size, alignment);
 	if (IS_ERR(node))
 		return PTR_ERR(node);
+
+	err = xe_ggtt_node_vf_shadow_alloc(node);
+	if (unlikely(err))
+		goto err;
 
 	xe_ggtt_assign(node, vfid);
 	xe_gt_sriov_dbg_verbose(gt, "VF%u assigned GGTT %llx-%llx\n",

@@ -11,6 +11,7 @@
 #include <kunit/visibility.h>
 #include <linux/fault-inject.h>
 #include <linux/io-64-nonatomic-lo-hi.h>
+#include <linux/ratelimit.h>
 #include <linux/sizes.h>
 
 #include <drm/drm_drv.h>
@@ -91,6 +92,12 @@ struct xe_ggtt_node {
 	struct work_struct delayed_removal_work;
 	/** @invalidate_on_remove: If it needs invalidation upon removal */
 	bool invalidate_on_remove;
+#ifdef CONFIG_PCI_IOV
+	/** @vf_shadow_ptes: MTL-only PF shadow of VF GGTT contents, without VFID bits */
+	u64 *vf_shadow_ptes;
+	/** @vf_shadow_len: Number of PTEs tracked in @vf_shadow_ptes */
+	u32 vf_shadow_len;
+#endif
 };
 
 /**
@@ -844,6 +851,9 @@ static void xe_ggtt_initial_clear(struct xe_ggtt *ggtt)
 
 static void ggtt_node_fini(struct xe_ggtt_node *node)
 {
+#ifdef CONFIG_PCI_IOV
+	kvfree(node->vf_shadow_ptes);
+#endif
 	kfree(node);
 }
 
@@ -1389,7 +1399,14 @@ static u64 xe_ggtt_write_dup_rep(struct xe_ggtt *ggtt, u64 addr, u64 pte, u16 vf
 	return addr;
 }
 
-static void xe_ggtt_assign_locked(const struct xe_ggtt_node *node, u16 vfid)
+static void xe_ggtt_reset_vf_shadow(struct xe_ggtt_node *node)
+{
+	if (node->vf_shadow_ptes)
+		memset(node->vf_shadow_ptes, 0,
+		       node->vf_shadow_len * sizeof(*node->vf_shadow_ptes));
+}
+
+static void xe_ggtt_assign_locked(struct xe_ggtt_node *node, u16 vfid)
 {
 	struct xe_ggtt *ggtt = node->ggtt;
 	u64 start = xe_ggtt_node_addr(node);
@@ -1404,7 +1421,40 @@ static void xe_ggtt_assign_locked(const struct xe_ggtt_node *node, u16 vfid)
 		start += XE_PAGE_SIZE;
 	}
 
+	xe_ggtt_reset_vf_shadow(node);
 	xe_ggtt_invalidate(ggtt);
+}
+
+/**
+ * xe_ggtt_node_vf_shadow_alloc - allocate MTL PF shadow of VF GGTT contents
+ * @node: the &xe_ggtt_node provisioned for a VF
+ *
+ * Allocates the per-node shadow PTE array used to stage VF-initiated GGTT
+ * updates on MTL. No-op on platforms that don't need the MTL GGTT binder.
+ *
+ * Return: 0 on success or a negative error code on failure.
+ */
+int xe_ggtt_node_vf_shadow_alloc(struct xe_ggtt_node *node)
+{
+	struct xe_device *xe;
+
+	if (!node)
+		return -ENOENT;
+
+	xe = tile_to_xe(node->ggtt->tile);
+	if (!xe_device_needs_mtl_ggtt_binder(xe))
+		return 0;
+
+	node->vf_shadow_len = xe_ggtt_node_size(node) / XE_PAGE_SIZE;
+	node->vf_shadow_ptes = kvcalloc(node->vf_shadow_len,
+						sizeof(*node->vf_shadow_ptes),
+						GFP_KERNEL);
+	if (!node->vf_shadow_ptes) {
+		node->vf_shadow_len = 0;
+		return -ENOMEM;
+	}
+
+	return 0;
 }
 
 /**
@@ -1416,7 +1466,7 @@ static void xe_ggtt_assign_locked(const struct xe_ggtt_node *node, u16 vfid)
  * In addition to PTE's VFID bits 11:2 also PRESENT bit 0 is set as on some
  * platforms VFs can't modify that either.
  */
-void xe_ggtt_assign(const struct xe_ggtt_node *node, u16 vfid)
+void xe_ggtt_assign(struct xe_ggtt_node *node, u16 vfid)
 {
 	guard(mutex)(&node->ggtt->lock);
 	xe_ggtt_assign_locked(node, vfid);
@@ -1503,14 +1553,20 @@ int xe_ggtt_node_load(struct xe_ggtt_node *node, const void *src, size_t size, u
 int xe_ggtt_update_vf_ptes(struct xe_ggtt_node *node, u16 vfid, u32 pte_offset,
 			   u8 mode, u16 num_copies, const u64 *ptes, u16 count)
 {
+	static DEFINE_RATELIMIT_STATE(mtl_shadow_rs, 5 * HZ, 10);
 	struct xe_ggtt *ggtt;
 	struct xe_device *xe;
+	struct xe_gt *gt;
 	u64 ggtt_addr, ggtt_addr_end, vf_ggtt_end;
+	u64 entry;
 	u16 n_ptes;
 	u16 remaining;
 	u16 copies;
 	u16 i;
+	u16 changed = 0;
+	u16 unchanged = 0;
 	bool duplicated;
+	bool mtl_path;
 
 	if (!node)
 		return -ENOENT;
@@ -1528,10 +1584,19 @@ int xe_ggtt_update_vf_ptes(struct xe_ggtt_node *node, u16 vfid, u32 pte_offset,
 		return -ERANGE;
 
 	n_ptes = num_copies ? num_copies + count : count;
+	if (node->vf_shadow_ptes && pte_offset + n_ptes > node->vf_shadow_len)
+		return -ERANGE;
 
-	if (xe_device_needs_mtl_ggtt_binder(xe) && IS_SRIOV_PF(xe))
+	mtl_path = xe_device_needs_mtl_ggtt_binder(xe) && IS_SRIOV_PF(xe);
+	gt = ggtt->tile->primary_gt ?: ggtt->tile->media_gt;
+
+	if (mtl_path)
 		drm_info_once(&xe->drm,
 			      "xe: MTL SR-IOV GGTT path: PF still applies VF GGTT updates via raw CPU writes with deferred invalidate\n");
+
+	if (mtl_path && node->vf_shadow_ptes)
+		drm_info_once(&xe->drm,
+			      "xe: MTL SR-IOV GGTT path: PF shadow tracking active for VF GGTT apply\n");
 
 	{
 		guard(mutex)(&ggtt->lock);
@@ -1544,6 +1609,26 @@ int xe_ggtt_update_vf_ptes(struct xe_ggtt_node *node, u16 vfid, u32 pte_offset,
 		switch (mode) {
 		case VF2PF_UPDATE_GGTT32_MODE_DUPLICATE:
 		case VF2PF_UPDATE_GGTT32_MODE_REPLICATE:
+			for (i = 0; i < copies; i++) {
+				entry = duplicated ? ptes[0] : ptes[0] + (u64)i * XE_PAGE_SIZE;
+				if (node->vf_shadow_ptes) {
+					if (node->vf_shadow_ptes[pte_offset + i] == entry)
+						unchanged++;
+					else
+						changed++;
+					node->vf_shadow_ptes[pte_offset + i] = entry;
+				}
+			}
+			for (i = 0; i < remaining; i++) {
+				entry = ptes[i + 1];
+				if (node->vf_shadow_ptes) {
+					if (node->vf_shadow_ptes[pte_offset + copies + i] == entry)
+						unchanged++;
+					else
+						changed++;
+					node->vf_shadow_ptes[pte_offset + copies + i] = entry;
+				}
+			}
 			ggtt_addr = xe_ggtt_write_dup_rep(ggtt, ggtt_addr, ptes[0], vfid,
 							  copies, duplicated);
 			for (i = 0; i < remaining; i++)
@@ -1552,6 +1637,27 @@ int xe_ggtt_update_vf_ptes(struct xe_ggtt_node *node, u16 vfid, u32 pte_offset,
 			break;
 		case VF2PF_UPDATE_GGTT32_MODE_DUPLICATE_LAST:
 		case VF2PF_UPDATE_GGTT32_MODE_REPLICATE_LAST:
+			for (i = 0; i < remaining; i++) {
+				entry = ptes[i];
+				if (node->vf_shadow_ptes) {
+					if (node->vf_shadow_ptes[pte_offset + i] == entry)
+						unchanged++;
+					else
+						changed++;
+					node->vf_shadow_ptes[pte_offset + i] = entry;
+				}
+			}
+			for (i = 0; i < copies; i++) {
+				entry = duplicated ? ptes[remaining] :
+					ptes[remaining] + (u64)i * XE_PAGE_SIZE;
+				if (node->vf_shadow_ptes) {
+					if (node->vf_shadow_ptes[pte_offset + remaining + i] == entry)
+						unchanged++;
+					else
+						changed++;
+					node->vf_shadow_ptes[pte_offset + remaining + i] = entry;
+				}
+			}
 			for (i = 0; i < remaining; i++)
 				ggtt_addr = xe_ggtt_write_one(ggtt, ggtt_addr, ptes[i], vfid);
 			ggtt_addr = xe_ggtt_write_dup_rep(ggtt, ggtt_addr, ptes[remaining],
@@ -1561,6 +1667,15 @@ int xe_ggtt_update_vf_ptes(struct xe_ggtt_node *node, u16 vfid, u32 pte_offset,
 			return -EINVAL;
 		}
 	}
+
+	if (mtl_path && node->vf_shadow_ptes && __ratelimit(&mtl_shadow_rs))
+		xe_gt_notice(gt,
+			     "MTL SR-IOV GGTT apply off=0x%x n=%u changed=%u unchanged=%u mode=%u copies=%u\n",
+			     pte_offset, n_ptes, changed, unchanged, mode, num_copies);
+
+	if (mtl_path && unchanged)
+		drm_info_once(&xe->drm,
+			      "xe: MTL SR-IOV GGTT path: PF shadow observed redundant VF GGTT updates before raw CPU apply\n");
 
 	xe_ggtt_invalidate_deferred(ggtt);
 	return n_ptes;
