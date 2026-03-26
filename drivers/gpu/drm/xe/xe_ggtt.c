@@ -1416,6 +1416,9 @@ static void xe_ggtt_assign_locked(struct xe_ggtt_node *node, u16 vfid)
 
 	lockdep_assert_held(&ggtt->lock);
 
+	if (!drm_mm_node_allocated(&node->base))
+		return;
+
 	while (start < end) {
 		ggtt->pt_ops->ggtt_set_pte(ggtt, start, pte);
 		start += XE_PAGE_SIZE;
