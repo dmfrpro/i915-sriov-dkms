@@ -174,7 +174,8 @@ static int pf_process_update_ggtt_msg(struct xe_gt *gt, u32 vfid,
 					       0 : num_copies;
 
 			ret = xe_ggtt_update_vf_ptes(node, vfid, pte_offset, mode,
-						     local_num_copies, start_range, range_size);
+						     local_num_copies, start_range, range_size,
+						     XE_GGTT_VF_UPDATE_SOURCE_RELAY_SERVICE);
 			if (ret < 0)
 				return ret;
 			updated += ret;
@@ -188,7 +189,8 @@ static int pf_process_update_ggtt_msg(struct xe_gt *gt, u32 vfid,
 	}
 
 	ret = xe_ggtt_update_vf_ptes(node, vfid, pte_offset, mode, num_copies,
-				     start_range, range_size);
+				     start_range, range_size,
+				     XE_GGTT_VF_UPDATE_SOURCE_RELAY_SERVICE);
 	if (ret < 0)
 		return ret;
 
