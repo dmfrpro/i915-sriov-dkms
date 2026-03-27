@@ -10,6 +10,7 @@
 
 #include <kunit/visibility.h>
 #include <linux/fault-inject.h>
+#include <linux/io.h>
 #include <linux/io-64-nonatomic-lo-hi.h>
 #include <linux/ratelimit.h>
 #include <linux/sizes.h>
@@ -214,6 +215,41 @@ static unsigned int probe_gsm_size(struct pci_dev *pdev)
 	pci_read_config_word(pdev, SNB_GMCH_CTRL, &gmch_ctl);
 	ggms = (gmch_ctl >> BDW_GMCH_GGMS_SHIFT) & BDW_GMCH_GGMS_MASK;
 	return ggms ? SZ_1M << ggms : 0;
+}
+
+static bool xe_ggtt_allow_direct_gsm_access(struct xe_ggtt *ggtt)
+{
+	struct xe_device *xe = tile_to_xe(ggtt->tile);
+
+	/*
+	 * Mirror i915's MTL PF preference as closely as possible for this
+	 * experiment: if firmware has relaxed stolen/GSM access permissions,
+	 * bypass the BAR-backed GGTT window and access GSM directly.
+	 */
+	if (MEDIA_VERx100(xe) != 1300 || IS_DGFX(xe) || IS_SRIOV_VF(xe))
+		return false;
+
+	if (ggtt->tile != xe_device_get_root_tile(xe))
+		return false;
+
+	return xe_mmio_read32(xe_root_tile_mmio(xe), MTL_PCODE_STOLEN_ACCESS) ==
+	       STOLEN_ACCESS_ALLOWED;
+}
+
+static u64 __iomem *xe_ggtt_map_gsm(struct xe_ggtt *ggtt, u64 gsm_size)
+{
+	struct xe_device *xe = tile_to_xe(ggtt->tile);
+	phys_addr_t phys_addr;
+
+	if (!xe_ggtt_allow_direct_gsm_access(ggtt))
+		return ggtt->tile->mmio.regs + SZ_8M;
+
+	drm_info_once(&xe->drm,
+		      "xe: MTL GGTT path: PF uses i915-like direct GSM mapping for GGTT PTE access\n");
+
+	phys_addr = xe_mmio_read64_2x32(xe_root_tile_mmio(xe), GSMBASE) & BDSM_MASK;
+
+	return devm_ioremap(xe->drm.dev, phys_addr, gsm_size);
 }
 
 static void ggtt_update_access_counter(struct xe_ggtt *ggtt)
@@ -797,7 +833,7 @@ int xe_ggtt_init_early(struct xe_ggtt *ggtt)
 {
 	struct xe_device *xe = tile_to_xe(ggtt->tile);
 	struct pci_dev *pdev = to_pci_dev(xe->drm.dev);
-	unsigned int gsm_size;
+	unsigned int gsm_size = 0;
 	u64 ggtt_start, wopcm = xe_wopcm_size(xe), ggtt_size;
 	int err;
 
@@ -824,7 +860,12 @@ int xe_ggtt_init_early(struct xe_ggtt *ggtt)
 		}
 	}
 
-	ggtt->gsm = ggtt->tile->mmio.regs + SZ_8M;
+	ggtt->gsm = xe_ggtt_map_gsm(ggtt, gsm_size);
+	if (!ggtt->gsm) {
+		xe_tile_err(ggtt->tile, "Failed to map GGTT page table\n");
+		return -ENOMEM;
+	}
+
 	if (IS_DGFX(xe) && xe->info.vram_flags & XE_VRAM_FLAGS_NEED64K)
 		ggtt->flags |= XE_GGTT_FLAGS_64K;
 
