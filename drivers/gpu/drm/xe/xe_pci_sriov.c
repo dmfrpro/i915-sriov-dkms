@@ -189,14 +189,6 @@ static int pf_enable_vfs(struct xe_device *xe, int num_vfs)
 	if (err < 0)
 		goto failed;
 
-	/*
-	 * E5: re-snapshot the runtime registers shared with the VFs at VF-enable
-	 * time - the GSC may have updated e.g. the HuC status register after
-	 * our initial probe (i915 does the same in i915_sriov_pf_enable_vfs()).
-	 */
-	for_each_gt(gt, xe, id)
-		xe_gt_sriov_pf_service_update(gt);
-
 	if (IS_DGFX(xe)) {
 		err = resize_vf_vram_bar(xe, num_vfs);
 		if (err)
