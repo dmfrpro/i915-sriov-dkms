@@ -708,9 +708,15 @@ static void xe_ggtt_clear(struct xe_ggtt *ggtt, u64 start, u64 size)
 		if (!ret)
 			return;
 
-		xe_tile_warn(ggtt->tile,
-			     "xe: MTL SR-IOV GGTT path: VF explicit clear failed (%pe), falling back to raw writes\n",
-			     ERR_PTR(ret));
+		/*
+		 * E4: do NOT fall back to raw GGTT writes on an MTL VF - the VF
+		 * cannot write its GGTT (writes are dropped), so failing silently
+		 * would leave the driver believing the clear happened.
+		 */
+		xe_tile_err(ggtt->tile,
+			    "xe: MTL SR-IOV GGTT path: VF explicit clear failed (%pe), skipping\n",
+			    ERR_PTR(ret));
+		return;
 	}
 #endif
 
@@ -1204,9 +1210,16 @@ static void xe_ggtt_map_bo(struct xe_ggtt *ggtt, struct xe_ggtt_node *node,
 		if (!ret)
 			return;
 
-		xe_tile_warn(ggtt->tile,
-			     "xe: MTL SR-IOV GGTT path: VF explicit map failed (%pe), falling back to raw writes\n",
-			     ERR_PTR(ret));
+		/*
+		 * E4: do NOT fall back to raw GGTT writes on an MTL VF - the VF
+		 * cannot write its GGTT (writes are dropped), so failing silently
+		 * would leave the BO unmapped while the driver believes the
+		 * mapping exists.
+		 */
+		xe_tile_err(ggtt->tile,
+			    "xe: MTL SR-IOV GGTT path: VF explicit map failed (%pe), skipping\n",
+			    ERR_PTR(ret));
+		return;
 	}
 #endif
 	if (!xe_bo_is_vram(bo) && !xe_bo_is_stolen(bo)) {
@@ -1458,14 +1471,26 @@ static u64 xe_encode_vfid_pte(u16 vfid)
 	return FIELD_PREP(GGTT_PTE_VFID, vfid) | XE_PAGE_PRESENT;
 }
 
-static u64 xe_ggtt_prepare_vf_pte(u64 pte, u16 vfid)
+static u64 xe_ggtt_prepare_vf_pte(struct xe_ggtt *ggtt, u64 pte, u16 vfid)
 {
+	struct xe_device *xe = tile_to_xe(ggtt->tile);
+
+	/*
+	 * E3: on the MTL PF-mediated GGTT path, mirror i915's
+	 * prepare_pattern_pte(): keep only the address and PAT bits from
+	 * the VF-supplied PTE, drop any other flag bits (LM/DM, MKTME,
+	 * stray PRESENT/VFID), and force VFID | PRESENT.
+	 */
+	if (xe_device_needs_mtl_ggtt_binder(xe))
+		pte &= XE_GGTT_PTE_ADDR_MASK | XELPG_GGTT_PTE_PAT0 |
+		       XELPG_GGTT_PTE_PAT1;
+
 	return u64_replace_bits(pte, vfid, GGTT_PTE_VFID) | XE_PAGE_PRESENT;
 }
 
 static u64 xe_ggtt_write_one(struct xe_ggtt *ggtt, u64 addr, u64 pte, u16 vfid)
 {
-	ggtt->pt_ops->ggtt_set_pte(ggtt, addr, xe_ggtt_prepare_vf_pte(pte, vfid));
+	ggtt->pt_ops->ggtt_set_pte(ggtt, addr, xe_ggtt_prepare_vf_pte(ggtt, pte, vfid));
 	return addr + XE_PAGE_SIZE;
 }
 
@@ -1685,7 +1710,7 @@ static void ggtt_vf_apply_work_func(struct work_struct *work)
 		ggtt_addr = xe_ggtt_node_addr(node) + (u64)start * XE_PAGE_SIZE;
 		for (i = start; i < end; i++, ggtt_addr += XE_PAGE_SIZE)
 			ggtt->pt_ops->ggtt_set_pte(ggtt, ggtt_addr,
-						   xe_ggtt_prepare_vf_pte(node->vf_shadow_ptes[i],
+						   xe_ggtt_prepare_vf_pte(ggtt, node->vf_shadow_ptes[i],
 									 node->vfid));
 		mutex_unlock(&ggtt->lock);
 
