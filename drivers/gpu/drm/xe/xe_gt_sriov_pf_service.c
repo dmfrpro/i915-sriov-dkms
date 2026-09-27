@@ -8,6 +8,7 @@
 #include "abi/guc_relay_actions_abi.h"
 
 #include "regs/xe_gt_regs.h"
+#include "regs/xe_gsc_regs.h"
 #include "regs/xe_gtt_defs.h"
 #include "regs/xe_guc_regs.h"
 
@@ -56,6 +57,16 @@ static const struct xe_reg pvc_runtime_regs[] = {
 	HUC_KERNEL_LOAD_INFO,		/* _MMIO(0xc1dc) */
 };
 
+/*
+ * E5: extra runtime registers served by i915 to VFs on MTL
+ * (i915's mtl_runtime_regs), which the Windows KMD queries.
+ */
+#define XELP_CTC_MODE			XE_REG(0xa26c)
+#define GEN9_TIMESTAMP_OVERRIDE		XE_REG(0x44074)
+#define MTL_GT_ACTIVITY_FACTOR		XE_REG(0x138010)
+#define MTL_MEDIA_GT_VEBOX_VDBOX_DISABLE XE_REG(0x389140)	/* media GT mirror of 0x9140 */
+#define MTL_MEDIA_HUC_KERNEL_LOAD_INFO	XE_REG(0x38c1dc)	/* media GT mirror of 0xc1dc */
+
 static const struct xe_reg ver_1270_runtime_regs[] = {
 	RPM_CONFIG0,			/* _MMIO(0x0d00) */
 	XEHP_FUSE4,			/* _MMIO(0x9114) */
@@ -66,7 +77,14 @@ static const struct xe_reg ver_1270_runtime_regs[] = {
 	GT_VEBOX_VDBOX_DISABLE,		/* _MMIO(0x9140) */
 	XEHP_GT_COMPUTE_DSS_ENABLE,	/* _MMIO(0x9144) */
 	XEHPC_GT_COMPUTE_DSS_ENABLE_EXT,/* _MMIO(0x9148) */
+	XELP_CTC_MODE,			/* _MMIO(0xa26c) */
 	HUC_KERNEL_LOAD_INFO,		/* _MMIO(0xc1dc) */
+	GEN9_TIMESTAMP_OVERRIDE,	/* _MMIO(0x44074) */
+	XE_REG(0x10100c),
+	HECI_FWSTS5(MTL_GSC_HECI1_BASE),	/* _MMIO(0x116c68) */
+	MTL_GT_ACTIVITY_FACTOR,		/* _MMIO(0x138010) */
+	MTL_MEDIA_GT_VEBOX_VDBOX_DISABLE,	/* _MMIO(0x389140) */
+	MTL_MEDIA_HUC_KERNEL_LOAD_INFO,		/* _MMIO(0x38c1dc) */
 };
 
 static const struct xe_reg ver_2000_runtime_regs[] = {

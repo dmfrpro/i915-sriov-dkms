@@ -11,6 +11,7 @@
 #include "xe_device.h"
 #include "xe_gt_sriov_pf_config.h"
 #include "xe_gt_sriov_pf_control.h"
+#include "xe_gt_sriov_pf_service.h"
 #include "xe_gt_sriov_printk.h"
 #include "xe_force_wake.h"
 #include "xe_gsc.h"
@@ -149,6 +150,8 @@ static int pf_enable_vfs(struct xe_device *xe, int num_vfs)
 {
 	struct pci_dev *pdev = to_pci_dev(xe->drm.dev);
 	int total_vfs = xe_sriov_pf_get_totalvfs(xe);
+	struct xe_gt *gt;
+	unsigned int id;
 	int err;
 
 	xe_assert(xe, IS_SRIOV_PF(xe));
@@ -185,6 +188,14 @@ static int pf_enable_vfs(struct xe_device *xe, int num_vfs)
 	err = xe_sriov_pf_provision_vfs(xe, num_vfs);
 	if (err < 0)
 		goto failed;
+
+	/*
+	 * E5: re-snapshot the runtime registers shared with the VFs at VF-enable
+	 * time - the GSC may have updated e.g. the HuC status register after
+	 * our initial probe (i915 does the same in i915_sriov_pf_enable_vfs()).
+	 */
+	for_each_gt(gt, xe, id)
+		xe_gt_sriov_pf_service_update(gt);
 
 	if (IS_DGFX(xe)) {
 		err = resize_vf_vram_bar(xe, num_vfs);
