@@ -346,13 +346,6 @@ static void ggtt_vf_apply_work_func(struct work_struct *work);
 
 #define XE_GGTT_PTE_ADDR_MASK					GENMASK_ULL(51, 12)
 
-static bool xe_ggtt_use_mtl_pf_mmio_invalidate(struct xe_ggtt *ggtt)
-{
-	struct xe_device *xe = tile_to_xe(ggtt->tile);
-
-	return xe_device_needs_mtl_ggtt_binder(xe) && IS_SRIOV_PF(xe);
-}
-
 static struct xe_gt *xe_ggtt_vf_relay_gt(struct xe_ggtt *ggtt)
 {
 	return ggtt->tile->primary_gt ?: ggtt->tile->media_gt;
@@ -1038,18 +1031,6 @@ static void ggtt_invalidate_gt_tlb(struct xe_gt *gt)
 	xe_gt_WARN(gt, err, "Failed to invalidate GGTT (%pe)", ERR_PTR(err));
 }
 
-static void ggtt_invalidate_gt_tlb_mmio(struct xe_gt *gt)
-{
-	unsigned int fw_ref;
-
-	if (!gt)
-		return;
-
-	fw_ref = xe_force_wake_get(gt_to_fw(gt), XE_FW_GT);
-	xe_mmio_write32(&gt->mmio, GUC_TLB_INV_CR, GUC_TLB_INV_CR_INVALIDATE);
-	xe_force_wake_put(gt_to_fw(gt), fw_ref);
-}
-
 static void ggtt_invalidate_work_func(struct work_struct *work)
 {
 	struct xe_ggtt *ggtt = container_of(work, struct xe_ggtt, invalidate_work);
@@ -1082,13 +1063,14 @@ static void xe_ggtt_invalidate(struct xe_ggtt *ggtt)
 	 */
 	xe_mmio_read32(xe_root_tile_mmio(xe), VF_CAP_REG);
 
-	if (xe_ggtt_use_mtl_pf_mmio_invalidate(ggtt)) {
-		drm_info_once(&xe->drm,
-			      "xe: MTL SR-IOV GGTT path: PF uses i915-like direct MMIO GGTT invalidate primitive\n");
-		ggtt_invalidate_gt_tlb_mmio(ggtt->tile->primary_gt);
-		ggtt_invalidate_gt_tlb_mmio(ggtt->tile->media_gt);
-		return;
-	}
+	/*
+	 * E6: on MTL PF use the GuC TLB invalidation (via ggtt_invalidate_gt_tlb
+	 * -> xe_tlb_inval_ggtt), like i915 does (has_guc_tlb_invalidation is
+	 * required for SR-IOV there). The raw GUC_TLB_INV_CR MMIO write used
+	 * before may not cover VF-tagged GGTT TLB entries. Note this must never
+	 * run from the GuC G2H worker context: xe_tlb_inval_ggtt() waits for
+	 * the TLB_INVALIDATION_DONE event that the same worker processes.
+	 */
 
 	/* Each GT in a tile has its own TLB to cache GGTT lookups */
 	ggtt_invalidate_gt_tlb(ggtt->tile->primary_gt);
