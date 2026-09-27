@@ -41,6 +41,7 @@
 #include "xe_page_reclaim.h"
 #include "xe_pm.h"
 #include "xe_sleep.h"
+#include "xe_sriov.h"
 #include "xe_sriov_vf.h"
 #include "xe_trace_guc.h"
 
@@ -1624,6 +1625,7 @@ static int parse_g2h_msg(struct xe_guc_ct *ct, u32 *msg, u32 len)
 	return ret;
 }
 
+#ifdef CONFIG_PCI_IOV
 static int mmio_relay_send_error(struct xe_guc *guc, u32 vfid, u32 magic, int fault)
 {
 	u32 request[PF2GUC_MMIO_RELAY_FAILURE_REQUEST_MSG_LEN] = {
@@ -1811,6 +1813,7 @@ static int mmio_relay_process(struct xe_guc *guc, struct xe_gt *gt,
 
 	return err;
 }
+#endif
 
 static int process_g2h_msg(struct xe_guc_ct *ct, u32 *msg, u32 len)
 {
@@ -1871,9 +1874,11 @@ static int process_g2h_msg(struct xe_guc_ct *ct, u32 *msg, u32 len)
 	case XE_GUC_ACTION_GUC2VF_RELAY_FROM_PF:
 		ret = xe_guc_relay_process_guc2vf(&guc->relay, hxg, hxg_len);
 		break;
+#ifdef CONFIG_PCI_IOV
 	case GUC_ACTION_GUC2PF_MMIO_RELAY_SERVICE:
 		ret = mmio_relay_process(guc, gt, hxg, hxg_len);
 		break;
+#endif
 	case GUC_ACTION_GUC2PF_VF_STATE_NOTIFY:
 		ret = xe_gt_sriov_pf_control_process_guc2pf(gt, hxg, hxg_len);
 		break;

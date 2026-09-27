@@ -9,11 +9,13 @@
 #include "xe_ggtt.h"
 
 #include <kunit/visibility.h>
+#include <linux/atomic.h>
 #include <linux/fault-inject.h>
 #include <linux/io.h>
 #include <linux/io-64-nonatomic-lo-hi.h>
 #include <linux/ratelimit.h>
 #include <linux/sizes.h>
+#include <linux/vmalloc.h>
 
 #include <drm/drm_drv.h>
 #include <drm/drm_managed.h>

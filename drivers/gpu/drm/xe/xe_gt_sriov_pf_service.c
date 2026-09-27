@@ -14,6 +14,7 @@
 #include "xe_assert.h"
 #include "xe_mmio.h"
 #include "xe_gt_sriov_printk.h"
+#include "xe_gt_sriov_pf_helpers.h"
 #include "xe_gt_sriov_pf_service.h"
 #include "xe_gt_sriov_pf_service_types.h"
 #include "xe_ggtt.h"
@@ -119,6 +120,7 @@ static const struct xe_reg ver_35_runtime_regs[] = {
 	SERVICE_COPY_ENABLE,		/* _MMIO(0x9170) */
 };
 
+#ifdef CONFIG_PCI_IOV
 static u64 get_pte_from_msg(const u32 *msg, u16 id)
 {
 	u32 pte_lo = FIELD_GET(VF2PF_UPDATE_GGTT32_REQUEST_DATAn_PTE_LO, msg[id * 2 + 2]);
@@ -200,6 +202,7 @@ static int pf_process_update_ggtt_msg(struct xe_gt *gt, u32 vfid,
 
 	return VF2PF_UPDATE_GGTT32_RESPONSE_MSG_LEN;
 }
+#endif
 
 static const struct xe_reg *pick_runtime_regs(struct xe_device *xe, unsigned int *count)
 {
@@ -475,9 +478,11 @@ int xe_gt_sriov_pf_service_process_request(struct xe_gt *gt, u32 origin,
 	case GUC_RELAY_ACTION_VF2PF_QUERY_RUNTIME:
 		ret = pf_process_runtime_query_msg(gt, origin, msg, msg_len, response, resp_size);
 		break;
+#ifdef CONFIG_PCI_IOV
 	case GUC_RELAY_ACTION_VF2PF_UPDATE_GGTT32:
 		ret = pf_process_update_ggtt_msg(gt, origin, msg, msg_len, response, resp_size);
 		break;
+#endif
 	default:
 		ret = -EOPNOTSUPP;
 		break;
