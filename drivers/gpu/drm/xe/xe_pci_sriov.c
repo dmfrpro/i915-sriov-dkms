@@ -150,8 +150,6 @@ static int pf_enable_vfs(struct xe_device *xe, int num_vfs)
 {
 	struct pci_dev *pdev = to_pci_dev(xe->drm.dev);
 	int total_vfs = xe_sriov_pf_get_totalvfs(xe);
-	struct xe_gt *gt;
-	unsigned int id;
 	int err;
 
 	xe_assert(xe, IS_SRIOV_PF(xe));
