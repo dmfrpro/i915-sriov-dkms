@@ -104,6 +104,61 @@
           };
         };
 
+      # WinDbg-like Windows kernel debugger from Linux, for debugging the
+      # SR-IOV Windows guest (https://github.com/dmaivel/ntoseye).
+      # Built without the Python embedding so no Python is required;
+      # the CLI, MCP server, DAP and GDB server integrations are kept.
+      ntoseye =
+        { rustPlatform, fetchFromGitHub, cmake, nasm, perl }:
+        rustPlatform.buildRustPackage rec {
+          pname = "ntoseye";
+          version = "0.44.0";
+
+          src = fetchFromGitHub {
+            owner = "dmaivel";
+            repo = "ntoseye";
+            rev = "v${version}";
+            hash = "sha256-2Yqwk09wC2/j8UO8Li3spMT49l81z9vwxuB4POZeifw=";
+          };
+
+          cargoLock.lockFile = src + "/Cargo.lock";
+
+          # aws-lc-sys (via reqwest's rustls) builds with bindgen + cmake/nasm
+          nativeBuildInputs = [
+            rustPlatform.bindgenHook
+            cmake
+            nasm
+            perl
+          ];
+
+          # ntoseye uses `if let` match guards (if_let_guard), still gated in
+          # this nixpkgs pin's rustc (1.89); upstream CI builds on a newer
+          # stable. Declare the feature and unlock the gate until nixpkgs
+          # catches up.
+          postPatch = ''
+            sed -i '1i #![feature(if_let_guard)]' src/lib.rs
+          '';
+          RUSTC_BOOTSTRAP = 1;
+
+          buildNoDefaultFeatures = true;
+          buildFeatures = [
+            "cli"
+            "mcp"
+            "dap"
+            "gdbserver"
+          ];
+
+          doCheck = false;
+
+          meta = {
+            platforms = [ "x86_64-linux" ];
+            description = "WinDbg-like kernel debugger for Windows, from Linux and macOS";
+            homepage = "https://ntoseye.com";
+            license = lib.licenses.mit;
+            mainProgram = "ntoseye";
+          };
+        };
+
       # dummy NixOS configuration with the SR-IOV drivers
       testNixosConfiguration = nixpkgs.lib.nixosSystem {
         system = "x86_64-linux";
@@ -143,6 +198,9 @@
       };
     in
     {
+      # ntoseye, for debugging the Windows guest (kernel/user-mode, MCP-driven)
+      packages.x86_64-linux.ntoseye = nixpkgs.legacyPackages.x86_64-linux.callPackage ntoseye { };
+
       # builds the SR-IOV drivers
       # this requires a dummy NixOS configuration due to the driver build environment depending on the specific kernel that is used
       checks.x86_64-linux.build-i915-sriov = testNixosConfiguration.config.system.build.toplevel;

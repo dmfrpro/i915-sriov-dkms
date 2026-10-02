@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "ntoseye": {
+      "command": "nix",
+      "args": ["run", ".#ntoseye", "--", "mcp"],
+      "startupTimeoutMs": 120000,
+      "toolTimeoutMs": 300000
+    }
+  }
+}
