@@ -2,3 +2,12 @@
 .vscode/
 src/
 pkg/
+*.o
+*.cmd
+*.mod
+*.mod.c
+modules.order
+Module.symvers
+conftest/results.h
+result
+result-*
