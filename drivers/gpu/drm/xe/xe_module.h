@@ -14,6 +14,8 @@ struct work_struct;
 struct xe_modparam {
 	bool force_execlist;
 	bool probe_display;
+	bool mtl_sriov_full_restore;
+	bool mtl_sriov_gpu_assign;
 	int force_vram_bar_size;
 	int guc_log_level;
 	char *guc_firmware_path;
@@ -34,4 +36,3 @@ bool xe_destroy_wq_queue(struct work_struct *work);
 void xe_destroy_wq_flush(void);
 
 #endif
-

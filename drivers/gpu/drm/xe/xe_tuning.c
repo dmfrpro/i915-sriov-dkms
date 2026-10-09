@@ -22,7 +22,7 @@
 
 static const struct xe_rtp_table_sr gt_tunings = XE_RTP_TABLE_SR(
 	{ XE_RTP_NAME("Tuning: Blend Fill Caching Optimization Disable"),
-	  XE_RTP_RULES(PLATFORM(DG2)),
+	  XE_RTP_RULES(PLATFORM(DG2), OR, GRAPHICS_VERSION_RANGE(1270, 1274)),
 	  XE_RTP_ACTIONS(SET(XEHP_L3SCQREG7, BLEND_FILL_CACHING_OPT_DIS))
 	},
 	{ XE_RTP_NAME("Tuning: 32B Access Enable"),

@@ -66,6 +66,7 @@ xe_guc_ct_send_block(struct xe_guc_ct *ct, const u32 *action, u32 len)
 /* This is only version of the send CT you can call from a G2H handler */
 int xe_guc_ct_send_g2h_handler(struct xe_guc_ct *ct, const u32 *action,
 			       u32 len);
+int xe_guc_ct_send_g2h_handler_nowait(struct xe_guc_ct *ct, const u32 *action, u32 len);
 
 /* Can't fail because a GT reset is in progress */
 int xe_guc_ct_send_recv_no_fail(struct xe_guc_ct *ct, const u32 *action,

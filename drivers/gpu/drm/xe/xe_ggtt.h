@@ -12,6 +12,8 @@ struct drm_printer;
 struct xe_bo;
 struct xe_tile;
 struct drm_exec;
+struct dma_fence;
+struct xe_sriov_vf_trace;
 
 struct xe_ggtt *xe_ggtt_alloc(struct xe_tile *tile);
 int xe_ggtt_init_early(struct xe_ggtt *ggtt);
@@ -42,7 +44,13 @@ int xe_ggtt_dump(struct xe_ggtt *ggtt, struct drm_printer *p);
 u64 xe_ggtt_print_holes(struct xe_ggtt *ggtt, u64 alignment, struct drm_printer *p);
 
 #ifdef CONFIG_PCI_IOV
-void xe_ggtt_assign(const struct xe_ggtt_node *node, u16 vfid);
+struct dma_fence *xe_ggtt_update_vf(struct xe_ggtt_node *node, u16 vfid,
+				 u32 offset, u8 mode, u16 copies, u64 pte);
+struct dma_fence *xe_ggtt_update_vf_ptes(struct xe_ggtt_node *node, u16 vfid,
+				      u32 offset, u8 mode, u16 copies,
+				      const u64 *input, u32 count);
+int xe_ggtt_invalidate_vf(struct xe_ggtt *ggtt, const struct xe_sriov_vf_trace *trace);
+int xe_ggtt_assign(const struct xe_ggtt_node *node, u16 vfid);
 int xe_ggtt_node_save(struct xe_ggtt_node *node, void *dst, size_t size, u16 vfid);
 int xe_ggtt_node_load(struct xe_ggtt_node *node, const void *src, size_t size, u16 vfid);
 #endif

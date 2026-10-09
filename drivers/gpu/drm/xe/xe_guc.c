@@ -40,9 +40,11 @@
 #include "xe_guc_submit.h"
 #include "xe_memirq.h"
 #include "xe_mmio.h"
+#include "xe_module.h"
 #include "xe_platform_types.h"
 #include "xe_sleep.h"
 #include "xe_sriov.h"
+#include "xe_trace.h"
 #include "xe_sriov_pf_migration.h"
 #include "xe_uc.h"
 #include "xe_uc_fw.h"
@@ -88,6 +90,20 @@ static u32 guc_ctl_feature_flags(struct xe_guc *guc)
 {
 	struct xe_device *xe = guc_to_xe(guc);
 	u32 flags = GUC_CTL_ENABLE_LITE_RESTORE;
+
+	/*
+	 * Keep the normal Xe default unless explicitly testing the experimental
+	 * MTL/ARL PF with foreign VF drivers. Those drivers do not use Xe's
+	 * per-job L3 read-only cache invalidation in xe_ring_ops.c.
+	 * Clearing only this GuC feature tests that assumption without changing
+	 * the relay, cache programming or context-switch workaround protocols.
+	 */
+	if (xe_modparam.mtl_sriov_full_restore && IS_SRIOV_PF(xe) &&
+	    xe->info.platform == XE_METEORLAKE) {
+		flags &= ~GUC_CTL_ENABLE_LITE_RESTORE;
+		xe_gt_info(guc_to_gt(guc),
+			   "experimental MTL/ARL SR-IOV: GuC lite restore disabled\n");
+	}
 
 	if (!xe->info.skip_guc_pc)
 		flags |= GUC_CTL_ENABLE_SLPC;
@@ -268,6 +284,12 @@ static void guc_init_params_post_hwconfig(struct xe_guc *guc)
 	params[GUC_CTL_DEBUG] = guc_ctl_debug_flags(guc);
 	params[GUC_CTL_ADS] = guc_ctl_ads_flags(guc);
 	params[GUC_CTL_WA] = guc_ctl_wa_flags(guc);
+	if (IS_SRIOV_PF(guc_to_xe(guc))) {
+		trace_xe_sriov_guc_params(guc_to_gt(guc), params[GUC_CTL_WA],
+					  params[GUC_CTL_FEATURE], params[GUC_CTL_ADS]);
+		xe_gt_info(guc_to_gt(guc), "VF trace GuC wa=%#x feature=%#x ads=%#x\n",
+			   params[GUC_CTL_WA], params[GUC_CTL_FEATURE], params[GUC_CTL_ADS]);
+	}
 	params[GUC_CTL_DEVID] = guc_ctl_devid(guc);
 
 	guc_print_params(guc);

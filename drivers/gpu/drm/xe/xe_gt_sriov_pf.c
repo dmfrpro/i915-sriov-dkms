@@ -98,6 +98,8 @@ static void pf_fini_action(void *arg)
 	struct xe_gt *gt = arg;
 
 	pf_fini_workers(gt);
+	xe_gt_sriov_pf_service_stop_mmio(gt);
+	xe_gt_sriov_pf_service_flush_mmio(gt);
 }
 
 static int pf_init_late(struct xe_gt *gt)

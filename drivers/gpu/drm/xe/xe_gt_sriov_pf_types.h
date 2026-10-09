@@ -33,6 +33,8 @@ struct xe_gt_sriov_metadata {
 
 	/** @migration: per-VF migration data. */
 	struct xe_gt_sriov_migration_data migration;
+	/** @mmio: legacy MMIO VF/PF transaction state. */
+	struct xe_gt_sriov_pf_mmio mmio;
 };
 
 /**

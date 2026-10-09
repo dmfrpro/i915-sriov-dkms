@@ -7,8 +7,35 @@
 #define _XE_GT_SRIOV_PF_SERVICE_TYPES_H_
 
 #include <linux/types.h>
+#include <linux/atomic.h>
+#include <linux/workqueue.h>
+#include <linux/completion.h>
+
+#include "abi/guc_relay_communication_abi.h"
+#include "xe_sriov_trace_types.h"
 
 struct xe_reg;
+struct xe_gt;
+
+/* One outstanding GGTT/MMIO transaction per VF and GT. */
+struct xe_gt_sriov_pf_mmio {
+	struct work_struct work;
+	struct xe_gt *gt;
+	u32 vfid;
+	u32 msg[6];
+	u32 ctb_msg[GUC_RELAY_MSG_MAX_LEN];
+	u32 ctb_len;
+	bool ctb;
+	struct completion ctb_done;
+	int ctb_result;
+	atomic_t pending;
+	atomic_t generation;
+	int request_generation;
+	int request_epoch;
+	int primary_epoch;
+	u64 trace_serial;
+	struct xe_sriov_vf_trace trace;
+};
 
 /**
  * struct xe_gt_sriov_pf_service_version - VF/PF ABI Version.
@@ -47,6 +74,8 @@ struct xe_gt_sriov_pf_service {
 		struct xe_gt_sriov_pf_service_version latest;
 	} version;
 	struct xe_gt_sriov_pf_service_runtime_regs runtime;
+	struct workqueue_struct *mmio_wq;
+	atomic_t mmio_epoch;
 };
 
 #endif

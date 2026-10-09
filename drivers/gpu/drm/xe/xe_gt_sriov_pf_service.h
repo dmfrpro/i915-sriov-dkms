@@ -18,10 +18,23 @@ void xe_gt_sriov_pf_service_update(struct xe_gt *gt);
 int xe_gt_sriov_pf_service_print_runtime(struct xe_gt *gt, struct drm_printer *p);
 
 #ifdef CONFIG_PCI_IOV
+int xe_gt_sriov_pf_service_process_mmio(struct xe_gt *gt, const u32 *msg, u32 len);
+void xe_gt_sriov_pf_service_stop_mmio(struct xe_gt *gt);
+void xe_gt_sriov_pf_service_flush_mmio(struct xe_gt *gt);
+void xe_gt_sriov_pf_service_reset_mmio_vf(struct xe_gt *gt, u32 vfid);
+bool xe_gt_sriov_pf_service_mmio_busy(struct xe_gt *gt, u32 vfid);
+void xe_gt_sriov_pf_service_flush_mmio_vf(struct xe_gt *gt, u32 vfid);
 int xe_gt_sriov_pf_service_process_request(struct xe_gt *gt, u32 origin,
 					   const u32 *msg, u32 msg_len,
 					   u32 *response, u32 resp_size);
 #else
+static inline int xe_gt_sriov_pf_service_process_mmio(struct xe_gt *gt,
+						   const u32 *msg, u32 len)
+{
+	return -EPROTO;
+}
+static inline void xe_gt_sriov_pf_service_stop_mmio(struct xe_gt *gt) { }
+static inline void xe_gt_sriov_pf_service_flush_mmio(struct xe_gt *gt) { }
 static inline int
 xe_gt_sriov_pf_service_process_request(struct xe_gt *gt, u32 origin,
 				       const u32 *msg, u32 msg_len,

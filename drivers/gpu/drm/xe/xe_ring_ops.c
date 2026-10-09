@@ -513,6 +513,7 @@ static void emit_migration_job_gen12(struct xe_sched_job *job,
 	struct xe_device *xe = gt_to_xe(gt);
 	u32 saddr = xe_lrc_start_seqno_ggtt_addr(lrc);
 	u32 dw[MAX_JOB_SIZE_DW], i = 0;
+	u32 ppgtt_flag = job->ggtt ? 0 : BIT(8);
 
 	*head = lrc->ring.tail;
 
@@ -524,13 +525,13 @@ static void emit_migration_job_gen12(struct xe_sched_job *job,
 
 	dw[i++] = MI_ARB_ON_OFF | MI_ARB_DISABLE; /* Enabled again below */
 
-	i = emit_bb_start(job->ptrs[0].batch_addr, BIT(8), dw, i);
+	i = emit_bb_start(job->ptrs[0].batch_addr, ppgtt_flag, dw, i);
 
 	dw[i++] = preparser_disable(true);
 	i = emit_flush_invalidate(saddr, seqno, job->migrate_flush_flags, dw, i);
 	dw[i++] = preparser_disable(false);
 
-	i = emit_bb_start(job->ptrs[1].batch_addr, BIT(8), dw, i);
+	i = emit_bb_start(job->ptrs[1].batch_addr, ppgtt_flag, dw, i);
 
 	i = emit_flush_imm_ggtt(xe_lrc_seqno_ggtt_addr(lrc), seqno,
 				job->migrate_flush_flags,

@@ -16,6 +16,7 @@
 
 #include "abi/guc_actions_abi.h"
 #include "abi/guc_actions_sriov_abi.h"
+#include "abi/guc_mmio_relay_abi.h"
 #include "abi/guc_klvs_abi.h"
 #include "xe_bo.h"
 #include "xe_devcoredump.h"
@@ -24,6 +25,7 @@
 #include "xe_gt_printk.h"
 #include "xe_gt_sriov_pf_control.h"
 #include "xe_gt_sriov_pf_monitor.h"
+#include "xe_gt_sriov_pf_service.h"
 #include "xe_guc.h"
 #include "xe_guc_log.h"
 #include "xe_guc_pagefault.h"
@@ -36,6 +38,8 @@
 #include "xe_sleep.h"
 #include "xe_sriov_vf.h"
 #include "xe_trace_guc.h"
+#include "xe_trace.h"
+#include "xe_sriov.h"
 
 static void receive_g2h(struct xe_guc_ct *ct);
 static void g2h_worker_func(struct work_struct *w);
@@ -726,6 +730,7 @@ static void stop_g2h_handler(struct xe_guc_ct *ct)
 void xe_guc_ct_disable(struct xe_guc_ct *ct)
 {
 	guc_ct_change_state(ct, XE_GUC_CT_STATE_DISABLED);
+	xe_gt_sriov_pf_service_stop_mmio(ct_to_gt(ct));
 	ct_exit_safe_mode(ct);
 	stop_g2h_handler(ct);
 }
@@ -752,6 +757,7 @@ void xe_guc_ct_stop(struct xe_guc_ct *ct)
 		return;
 
 	guc_ct_change_state(ct, XE_GUC_CT_STATE_STOPPED);
+	xe_gt_sriov_pf_service_stop_mmio(ct_to_gt(ct));
 	stop_g2h_handler(ct);
 }
 
@@ -1273,6 +1279,13 @@ int xe_guc_ct_send_g2h_handler(struct xe_guc_ct *ct, const u32 *action, u32 len)
 	return ret;
 }
 
+/* No nested G2H processing: callers may need to revalidate a VF generation. */
+int xe_guc_ct_send_g2h_handler_nowait(struct xe_guc_ct *ct, const u32 *action, u32 len)
+{
+	lockdep_assert_held(&ct->lock);
+	return __guc_ct_send_locked(ct, action, len, 0, 0, NULL);
+}
+
 /*
  * Check if a GT reset is in progress or will occur and if GT reset brought the
  * CT back up. Randomly picking 5 seconds for an upper limit to do a GT a reset.
@@ -1617,6 +1630,24 @@ static int parse_g2h_msg(struct xe_guc_ct *ct, u32 *msg, u32 len)
 	return ret;
 }
 
+static bool pf_diag_guc_action(u32 action)
+{
+	switch (action) {
+	case XE_GUC_ACTION_CONTEXT_RESET_NOTIFICATION:
+	case XE_GUC_ACTION_ENGINE_FAILURE_NOTIFICATION:
+	case XE_GUC_ACTION_STATE_CAPTURE_NOTIFICATION:
+	case XE_GUC_ACTION_NOTIFY_MEMORY_CAT_ERROR:
+	case GUC_ACTION_GUC2PF_VF_STATE_NOTIFY:
+	case GUC_ACTION_GUC2PF_ADVERSE_EVENT:
+	case XE_GUC_ACTION_NOTIFY_CRASH_DUMP_POSTED:
+	case XE_GUC_ACTION_NOTIFY_EXCEPTION:
+	case XE_GUC_ACTION_NOTIFY_MULTI_QUEUE_CGP_CONTEXT_ERROR:
+		return true;
+	default:
+		return false;
+	}
+}
+
 static int process_g2h_msg(struct xe_guc_ct *ct, u32 *msg, u32 len)
 {
 	struct xe_guc *guc = ct_to_guc(ct);
@@ -1626,6 +1657,7 @@ static int process_g2h_msg(struct xe_guc_ct *ct, u32 *msg, u32 len)
 	u32 action, adj_len;
 	u32 *payload;
 	int ret = 0;
+	bool diag;
 
 	if (FIELD_GET(GUC_HXG_MSG_0_TYPE, hxg[0]) != GUC_HXG_TYPE_EVENT)
 		return 0;
@@ -1633,6 +1665,10 @@ static int process_g2h_msg(struct xe_guc_ct *ct, u32 *msg, u32 len)
 	action = FIELD_GET(GUC_HXG_EVENT_MSG_0_ACTION, hxg[0]);
 	payload = hxg + GUC_HXG_EVENT_MSG_MIN_LEN;
 	adj_len = hxg_len - GUC_HXG_EVENT_MSG_MIN_LEN;
+	diag = trace_xe_sriov_pf_guc_event_enabled() && IS_SRIOV_PF(gt_to_xe(gt)) &&
+		pf_diag_guc_action(action);
+	if (diag)
+		trace_xe_sriov_pf_guc_event(gt, action, false, 0, hxg, hxg_len);
 
 	switch (action) {
 	case XE_GUC_ACTION_SCHED_CONTEXT_MODE_DONE:
@@ -1682,6 +1718,14 @@ static int process_g2h_msg(struct xe_guc_ct *ct, u32 *msg, u32 len)
 	case GUC_ACTION_GUC2PF_ADVERSE_EVENT:
 		ret = xe_gt_sriov_pf_monitor_process_guc2pf(gt, hxg, hxg_len);
 		break;
+	case GUC_ACTION_GUC2PF_MMIO_RELAY_SERVICE:
+		ret = xe_gt_sriov_pf_service_process_mmio(gt, hxg, hxg_len);
+		if (ret)
+			xe_gt_err(gt, "MMIO relay rejected (%pe) len %u msg %*ph\n",
+				  ERR_PTR(ret), hxg_len, (int)sizeof(u32) * hxg_len, hxg);
+		/* A malformed VF request must not mark the PF CT channel dead. */
+		ret = 0;
+		break;
 	case XE_GUC_ACTION_NOTIFY_CRASH_DUMP_POSTED:
 	case XE_GUC_ACTION_NOTIFY_EXCEPTION:
 		ret = guc_crash_process_msg(ct, action);
@@ -1701,6 +1745,9 @@ static int process_g2h_msg(struct xe_guc_ct *ct, u32 *msg, u32 len)
 	default:
 		xe_gt_err(gt, "unexpected G2H action 0x%04x\n", action);
 	}
+
+	if (diag)
+		trace_xe_sriov_pf_guc_event(gt, action, true, ret, hxg, hxg_len);
 
 	if (ret) {
 		xe_gt_err(gt, "G2H action %#04x failed (%pe) len %u msg %*ph\n",

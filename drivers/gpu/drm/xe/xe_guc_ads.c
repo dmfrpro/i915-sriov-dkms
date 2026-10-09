@@ -28,6 +28,8 @@
 #include "xe_lrc.h"
 #include "xe_map.h"
 #include "xe_mmio.h"
+#include "xe_sriov.h"
+#include "xe_trace.h"
 #include "xe_wa.h"
 
 /* Slack of a few additional entries per engine */
@@ -270,6 +272,9 @@ static void guc_waklv_enable(struct xe_guc_ads *ads,
 	size_t size = sizeof(u32) * (1 + data_len_dw);
 
 	if (*remain < size) {
+		if (IS_SRIOV_PF(ads_to_xe(ads)))
+			trace_xe_sriov_pf_wa_klv(ads_to_gt(ads), klv_id, data,
+						data_len_dw, -ENOSPC);
 		drm_warn(&ads_to_xe(ads)->drm,
 			 "w/a klv buffer too small to add klv id 0x%04X\n", klv_id);
 		return;
@@ -281,6 +286,8 @@ static void guc_waklv_enable(struct xe_guc_ads *ads,
 	/* data_len_dw dwords of data */
 	xe_map_memcpy_to(ads_to_xe(ads), ads_to_map(ads),
 			 *offset + sizeof(u32), data, data_len_dw * sizeof(u32));
+	if (IS_SRIOV_PF(ads_to_xe(ads)))
+		trace_xe_sriov_pf_wa_klv(ads_to_gt(ads), klv_id, data, data_len_dw, 0);
 
 	*offset += size;
 	*remain -= size;

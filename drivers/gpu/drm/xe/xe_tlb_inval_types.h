@@ -14,6 +14,13 @@
 struct drm_suballoc;
 struct xe_tlb_inval;
 
+enum xe_tlb_trace_op {
+	XE_TLB_TRACE_NONE,
+	XE_TLB_TRACE_ALL,
+	XE_TLB_TRACE_GGTT,
+	XE_TLB_TRACE_RANGE,
+};
+
 /** struct xe_tlb_inval_ops - TLB invalidation ops (backend) */
 struct xe_tlb_inval_ops {
 	/**
@@ -80,6 +87,8 @@ struct xe_tlb_inval {
 	void *private;
 	/** @xe: Pointer to Xe device */
 	struct xe_device *xe;
+	/** @trace_gt_id: GT identity for diagnostics */
+	u8 trace_gt_id;
 	/** @ops: TLB invalidation ops */
 	const struct xe_tlb_inval_ops *ops;
 	/** @tlb_inval.seqno: TLB invalidation seqno, protected by CT lock */
@@ -132,6 +141,20 @@ struct xe_tlb_inval_fence {
 	int seqno;
 	/** @inval_time: time of TLB invalidation */
 	ktime_t inval_time;
+	/** @trace_op: operation, fixed before issue */
+	enum xe_tlb_trace_op trace_op;
+	/** @trace_origin_gt: requesting GT, which can differ from target */
+	u8 trace_origin_gt;
+	/** @trace_vfid: VF mapping owner, zero for PF */
+	u32 trace_vfid;
+	/** @trace_id: VF service transaction, zero for PF */
+	u64 trace_id;
+	/** @trace_asid: range address space */
+	u32 trace_asid;
+	/** @trace_start: range start */
+	u64 trace_start;
+	/** @trace_end: exclusive range end */
+	u64 trace_end;
 };
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 1, 0)

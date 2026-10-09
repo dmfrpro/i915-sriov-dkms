@@ -4,6 +4,7 @@
  */
 
 #include "xe_migrate.h"
+#include "abi/guc_ggtt_relay_abi.h"
 
 #include <linux/bitfield.h>
 #include <linux/sizes.h>
@@ -837,6 +838,58 @@ static void emit_copy(struct xe_gt *gt, struct xe_bb *bb,
 static u64 xe_migrate_batch_base(struct xe_migrate *m, bool usm)
 {
 	return usm ? m->usm_batch_base_ofs : m->batch_base_ofs;
+}
+
+/* Media 13 VF mappings must be updated by the PF command streamer. */
+struct dma_fence *xe_migrate_update_ggtt(struct xe_migrate *m, u32 offset,
+				     const u64 *ptes, u32 count)
+{
+	struct xe_gt *gt = m->tile->primary_gt;
+	struct xe_sched_job *job;
+	struct dma_fence *fence;
+	struct xe_bb *bb;
+	u32 i = 0, n, j;
+
+	if (!count || count > VF2PF_GGTT_MAX_EXPANDED_PTES ||
+	    !IS_ALIGNED(offset, XE_PAGE_SIZE) ||
+	    (u64)offset + (u64)count * XE_PAGE_SIZE > GUC_GGTT_TOP)
+		return ERR_PTR(-EINVAL);
+
+	/* 511 entries per command: 512 triggers a reset in the i915 reference. */
+	bb = xe_bb_new(gt, 1 + 2 * count + 2 * DIV_ROUND_UP(count, 511), false);
+	if (IS_ERR(bb))
+		return ERR_CAST(bb);
+
+	/* Use the existing two-batch migration ring path, with an empty first BB. */
+	bb->cs[bb->len++] = MI_BATCH_BUFFER_END;
+	while (i < count) {
+		n = min_t(u32, 511, count - i);
+		bb->cs[bb->len++] = MI_UPDATE_GTT | (2 * n);
+		bb->cs[bb->len++] = offset + i * XE_PAGE_SIZE;
+		for (j = 0; j < n; j++, i++) {
+			bb->cs[bb->len++] = lower_32_bits(ptes[i]);
+			bb->cs[bb->len++] = upper_32_bits(ptes[i]);
+		}
+	}
+
+	/* MI_UPDATE_GTT is privileged: execute the kernel BB from the PF GGTT. */
+	job = xe_bb_create_migration_job(m->q, bb,
+				       xe_sa_manager_gpu_addr(m->tile->mem.kernel_bb_pool), 1);
+	if (IS_ERR(job)) {
+		xe_bb_free(bb, NULL);
+		return ERR_CAST(job);
+	}
+	job->ggtt = true;
+	xe_sched_job_add_migrate_flush(job, MI_INVALIDATE_TLB);
+	mutex_lock(&m->job_mutex);
+	xe_sched_job_arm(job);
+	fence = dma_fence_get(&job->drm.s_fence->finished);
+	xe_sched_job_push(job);
+	dma_fence_put(m->fence);
+	m->fence = dma_fence_get(fence);
+	mutex_unlock(&m->job_mutex);
+	xe_bb_free(bb, fence);
+	return fence;
 }
 
 static u32 xe_migrate_ccs_copy(struct xe_migrate *m,

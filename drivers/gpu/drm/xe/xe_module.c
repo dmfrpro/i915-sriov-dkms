@@ -41,6 +41,16 @@ MODULE_PARM_DESC(svm_notifier_size, "Set the svm notifier size in MiB, must be p
 module_param_named_unsafe(force_execlist, xe_modparam.force_execlist, bool, 0444);
 MODULE_PARM_DESC(force_execlist, "Force Execlist submission");
 
+module_param_named_unsafe(mtl_sriov_full_restore,
+			  xe_modparam.mtl_sriov_full_restore, bool, 0444);
+MODULE_PARM_DESC(mtl_sriov_full_restore,
+		 "Experimental MTL/ARL SR-IOV PF diagnostic: disable GuC lite restore (default=false)");
+
+module_param_named_unsafe(mtl_sriov_gpu_assign,
+			  xe_modparam.mtl_sriov_gpu_assign, bool, 0444);
+MODULE_PARM_DESC(mtl_sriov_gpu_assign,
+		 "Experimental MTL/ARL SR-IOV PF diagnostic: assign GGTT owner using MI_UPDATE_GTT (default=false)");
+
 #if IS_ENABLED(CONFIG_DRM_XE_DISPLAY)
 module_param_named(probe_display, xe_modparam.probe_display, bool, 0444);
 MODULE_PARM_DESC(probe_display, "Probe display HW, otherwise it's left untouched "

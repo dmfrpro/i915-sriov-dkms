@@ -6,16 +6,23 @@
 #include "xe_gt_debugfs.h"
 
 #include <linux/debugfs.h>
+#include <linux/ktime.h>
 
 #include <drm/drm_debugfs.h>
 #include <drm/drm_managed.h>
 
+#include "regs/xe_engine_regs.h"
+#include "regs/xe_gtt_defs.h"
+#include "regs/xe_gt_regs.h"
+
 #include "xe_device.h"
 #include "xe_force_wake.h"
+#include "xe_ggtt.h"
 #include "xe_gt.h"
 #include "xe_gt_mcr.h"
 #include "xe_gt_idle.h"
 #include "xe_gt_sriov_pf_debugfs.h"
+#include "xe_gt_sriov_pf_helpers.h"
 #include "xe_gt_sriov_vf_debugfs.h"
 #include "xe_gt_stats.h"
 #include "xe_gt_topology.h"
@@ -23,6 +30,7 @@
 #include "xe_hw_engine.h"
 #include "xe_lrc.h"
 #include "xe_mocs.h"
+#include "xe_mmio.h"
 #include "xe_pat.h"
 #include "xe_pm.h"
 #include "xe_reg_sr.h"
@@ -130,6 +138,60 @@ static int steering(struct xe_gt *gt, struct drm_printer *p)
 	return 0;
 }
 
+/* Shared GT/engine programming, not a snapshot of a Windows VF context. */
+static int mtl_sriov_cache_state(struct xe_gt *gt, struct drm_printer *p)
+{
+	static const struct {
+		const char *name;
+		struct xe_reg_mcr reg;
+		u32 mask;
+		u32 i915_expected;
+	} regs[] = {
+		{ "BLEND_FILL_CACHING_OPT_DIS", XEHP_L3SCQREG7,
+		  BLEND_FILL_CACHING_OPT_DIS, BLEND_FILL_CACHING_OPT_DIS },
+		{ "EN_32B_ACCESS", XEHP_SQCM, EN_32B_ACCESS, EN_32B_ACCESS },
+		/* i915 STACKID_CTRL_512 = FIELD_PREP(GENMASK(6, 5), 2). */
+		{ "STACKID_CTRL", RT_CTRL, REG_GENMASK(6, 5),
+		  REG_FIELD_PREP(REG_GENMASK(6, 5), 2) },
+		{ "INDIRECT_STATE_BASE_ADDR_OVERRIDE", SAMPLER_MODE,
+		  INDIRECT_STATE_BASE_ADDR_OVERRIDE,
+		  INDIRECT_STATE_BASE_ADDR_OVERRIDE },
+		{ "DIS_FIX_EOT1_FLUSH", ROW_CHICKEN3,
+		  DIS_FIX_EOT1_FLUSH, DIS_FIX_EOT1_FLUSH },
+		{ "DISABLE_TDL_SVHS_GATING", ROW_CHICKEN2,
+		  DISABLE_TDL_SVHS_GATING, DISABLE_TDL_SVHS_GATING },
+		{ "FORCE_MISS_FTLB", COMP_MOD_CTRL,
+		  FORCE_MISS_FTLB, FORCE_MISS_FTLB },
+		{ "ENFORCE_RAR", SQCNT1, ENFORCE_RAR, ENFORCE_RAR },
+	};
+	struct xe_device *xe = gt_to_xe(gt);
+	unsigned int i;
+
+	if (!IS_SRIOV_PF(xe) || xe_gt_is_media_type(gt) ||
+	    GRAPHICS_VERx100(xe) < 1270 || GRAPHICS_VERx100(xe) > 1274)
+		return -ENODEV;
+
+	CLASS(xe_force_wake, fw_ref)(gt_to_fw(gt), XE_FORCEWAKE_ALL);
+	if (!xe_force_wake_ref_has_domain(fw_ref.domains, XE_FORCEWAKE_ALL))
+		return -ETIMEDOUT;
+
+	drm_printf(p, "gt=%u gfx=%u scope=shared-pf-gt-engine\n",
+		   gt->info.id, GRAPHICS_VERx100(xe));
+	drm_printf(p, "Sequential MCR reads; one valid instance per register.\n");
+	drm_printf(p, "Not VF context state or cache contents.\n");
+	for (i = 0; i < ARRAY_SIZE(regs); i++) {
+		u32 value = xe_gt_mcr_unicast_read_any(gt, regs[i].reg);
+
+		drm_printf(p, "%s reg=%#x val=%#x mask=%#x got=%#x i915=%#x match=%s\n",
+			   regs[i].name, regs[i].reg.__reg.addr, value,
+			   regs[i].mask, value & regs[i].mask,
+			   regs[i].i915_expected,
+			   str_yes_no((value & regs[i].mask) == regs[i].i915_expected));
+	}
+
+	return 0;
+}
+
 static int register_save_restore(struct xe_gt *gt, struct drm_printer *p)
 {
 	struct xe_hw_engine *hwe;
@@ -154,6 +216,131 @@ static int register_save_restore(struct xe_gt *gt, struct drm_printer *p)
 		xe_reg_whitelist_dump(&hwe->oa_whitelist, p);
 	}
 
+	return 0;
+}
+
+struct mtl_sriov_render_identity {
+	u32 lrca;
+	u64 status;
+	u64 pte;
+	u32 range_vf;
+};
+
+static struct mtl_sriov_render_identity
+mtl_sriov_render_identity(struct xe_hw_engine *hwe)
+{
+	struct xe_gt *gt = hwe->gt;
+	struct xe_ggtt *ggtt = gt->tile->mem.ggtt;
+	struct mtl_sriov_render_identity id = {};
+	unsigned int n, total = xe_gt_sriov_pf_get_totalvfs(gt);
+
+	id.lrca = xe_hw_engine_mmio_read32(hwe, RING_CURRENT_LRCA(0));
+	id.status = xe_mmio_read64_2x32(&gt->mmio,
+				      RING_EXECLIST_STATUS_LO(hwe->mmio_base));
+	/* Zero may be power-gated/idle. Do not assign it to a VF or read page 0. */
+	if (!id.lrca || !IS_ALIGNED(id.lrca, XE_PAGE_SIZE) || id.lrca >= GUC_GGTT_TOP)
+		return id;
+
+	/* Protect provisioning metadata, not hardware context switching. */
+	guard(mutex)(xe_gt_sriov_pf_master_mutex(gt));
+	for (n = 1; n <= total; n++) {
+		const struct xe_ggtt_node *node = gt->sriov.pf.vfs[n].config.ggtt_region;
+		u64 start, size;
+
+		if (!node)
+			continue;
+		start = xe_ggtt_node_addr(node);
+		size = xe_ggtt_node_size(node);
+		if (id.lrca >= start && id.lrca - start < size) {
+			id.range_vf = n;
+			break;
+		}
+	}
+	id.pte = xe_ggtt_read_pte(ggtt, id.lrca);
+	return id;
+}
+
+static void mtl_sriov_render_identity_print(struct drm_printer *p,
+					  const char *phase, struct xe_hw_engine *hwe,
+					  const struct mtl_sriov_render_identity *id)
+{
+	drm_printf(p, "%s engine=%s lrca=%#x status=%#llx range_vf=%u ",
+		   phase, hwe->name, id->lrca, id->status, id->range_vf);
+	drm_printf(p, "pte=%#llx pte_present=%u pte_owner=%llu\n", id->pte,
+		   !!(id->pte & XE_PAGE_PRESENT), u64_get_bits(id->pte, GGTT_PTE_VFID));
+}
+
+/* Observational bracket only: equality cannot exclude a switch away and back. */
+static int mtl_sriov_render_state(struct xe_gt *gt, struct drm_printer *p)
+{
+	static const struct {
+		const char *name;
+		struct xe_reg_mcr reg;
+		u32 mask;
+	} regs[] = {
+		{ "MSAA_OPTIMIZATION_REDUC_DISABLE", CACHE_MODE_1,
+		  MSAA_OPTIMIZATION_REDUC_DISABLE },
+		{ "FD_END_COLLECT", XEHP_PSS_CHICKEN, FD_END_COLLECT },
+		{ "DISABLE_STATE_CACHE_PERF_FIX", XEHP_COMMON_SLICE_CHICKEN3,
+		  DISABLE_STATE_CACHE_PERF_FIX },
+		{ "L3_PWM_TIMER_INIT_VAL", XEHP_L3SQCREG5, L3_PWM_TIMER_INIT_VAL_MASK },
+	};
+	struct xe_device *xe = gt_to_xe(gt);
+	struct xe_hw_engine *rcs = &gt->hw_engines[XE_HW_ENGINE_RCS0];
+	struct xe_hw_engine *bcs = &gt->hw_engines[XE_HW_ENGINE_BCS0];
+	struct mtl_sriov_render_identity before[2], after[2];
+	u32 values[ARRAY_SIZE(regs)], lncf[8], nonpriv[RING_MAX_NONPRIV_SLOTS];
+	u64 start_ns, end_ns;
+	unsigned int i;
+	bool bracket_equal, owner_matches;
+
+	if (!IS_SRIOV_PF(xe) || xe_gt_is_media_type(gt) ||
+	    GRAPHICS_VERx100(xe) < 1270 || GRAPHICS_VERx100(xe) > 1274 ||
+	    !xe_hw_engine_is_valid(rcs) || !xe_hw_engine_is_valid(bcs))
+		return -ENODEV;
+
+	CLASS(xe_force_wake, fw_ref)(gt_to_fw(gt), XE_FORCEWAKE_ALL);
+	if (!xe_force_wake_ref_has_domain(fw_ref.domains, XE_FORCEWAKE_ALL))
+		return -ETIMEDOUT;
+
+	start_ns = ktime_get_ns();
+	before[0] = mtl_sriov_render_identity(rcs);
+	before[1] = mtl_sriov_render_identity(bcs);
+	for (i = 0; i < ARRAY_SIZE(regs); i++)
+		values[i] = xe_gt_mcr_unicast_read_any(gt, regs[i].reg);
+	for (i = 0; i < ARRAY_SIZE(lncf); i++)
+		lncf[i] = xe_gt_mcr_unicast_read_any(gt, XEHP_LNCFCMOCS(i));
+	for (i = 0; i < ARRAY_SIZE(nonpriv); i++)
+		nonpriv[i] = xe_hw_engine_mmio_read32(rcs, RING_FORCE_TO_NONPRIV(0, i));
+	after[1] = mtl_sriov_render_identity(bcs);
+	after[0] = mtl_sriov_render_identity(rcs);
+	end_ns = ktime_get_ns();
+
+	bracket_equal = before[0].lrca && before[0].lrca == after[0].lrca &&
+		before[0].status == after[0].status && before[0].pte == after[0].pte &&
+		before[0].range_vf == after[0].range_vf;
+	owner_matches = before[0].range_vf && (before[0].pte & XE_PAGE_PRESENT) &&
+		before[0].range_vf == u64_get_bits(before[0].pte, GGTT_PTE_VFID);
+	drm_printf(p, "gt=%u gfx=%u start_ns=%llu end_ns=%llu ",
+		   gt->info.id, GRAPHICS_VERx100(xe), start_ns, end_ns);
+	drm_printf(p, "rcs_bracket_equal=%u rcs_owner_matches=%u\n",
+		   bracket_equal, owner_matches);
+	drm_puts(p, "Sequential reads, one valid MCR instance; no context pause.\n");
+	drm_puts(p, "Equal brackets do not exclude an ABA switch or prove VF execution.\n");
+	mtl_sriov_render_identity_print(p, "before", rcs, &before[0]);
+	mtl_sriov_render_identity_print(p, "before", bcs, &before[1]);
+	for (i = 0; i < ARRAY_SIZE(regs); i++)
+		drm_printf(p, "%s reg=%#x val=%#x mask=%#x got=%#x\n",
+			   regs[i].name, regs[i].reg.__reg.addr, values[i],
+			   regs[i].mask, values[i] & regs[i].mask);
+	for (i = 0; i < ARRAY_SIZE(lncf); i++)
+		drm_printf(p, "LNCF%u reg=%#x val=%#x\n", i,
+			   XEHP_LNCFCMOCS(i).__reg.addr, lncf[i]);
+	for (i = 0; i < ARRAY_SIZE(nonpriv); i++)
+		drm_printf(p, "NONPRIV%u reg=%#x val=%#x\n", i,
+			   RING_FORCE_TO_NONPRIV(rcs->mmio_base, i).addr, nonpriv[i]);
+	mtl_sriov_render_identity_print(p, "after", bcs, &after[1]);
+	mtl_sriov_render_identity_print(p, "after", rcs, &after[0]);
 	return 0;
 }
 
@@ -241,6 +428,10 @@ static const struct drm_info_list vf_safe_debugfs_list[] = {
 
 /* everything else should be added here */
 static const struct drm_info_list pf_only_debugfs_list[] = {
+	{ "mtl_sriov_render_state", .show = xe_gt_debugfs_show_with_rpm,
+	  .data = mtl_sriov_render_state },
+	{ "mtl_sriov_cache_state", .show = xe_gt_debugfs_show_with_rpm,
+	  .data = mtl_sriov_cache_state },
 	{ "hw_engines", .show = xe_gt_debugfs_show_with_rpm, .data = hw_engines },
 	{ "mocs", .show = xe_gt_debugfs_show_with_rpm, .data = xe_mocs_dump },
 	{ "pat", .show = xe_gt_debugfs_show_with_rpm, .data = xe_pat_dump },

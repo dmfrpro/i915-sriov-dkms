@@ -26,6 +26,7 @@
 #include "xe_guc_relay.h"
 #include "xe_guc_relay_types.h"
 #include "xe_sriov.h"
+#include "xe_trace.h"
 
 /*
  * How long should we wait for the response?
@@ -305,6 +306,10 @@ static int relay_send_transaction(struct xe_guc_relay *relay, struct relay_trans
 		    txn->rid, txn->remote, (int)sizeof(u32) * len, msg);
 
 	ret = xe_guc_ct_send_block(relay_to_ct(relay), buf, len + txn->offset);
+	if (txn->incoming && IS_SRIOV_PF(relay_to_xe(relay)))
+		trace_xe_sriov_relay(relay_to_gt(relay), txn->remote, txn->rid,
+			FIELD_GET(GUC_HXG_REQUEST_MSG_0_ACTION, txn->request_buf[txn->offset]),
+			XE_SRIOV_TRACE_RESPONSE_SEND, ret);
 
 	if (unlikely(ret > 0)) {
 		relay_notice(relay, "Unexpected data=%d from GuC, wrong ABI?\n", ret);
@@ -719,12 +724,36 @@ static struct relay_transaction *relay_dequeue_transaction(struct xe_guc_relay *
 	return txn;
 }
 
+static void pf_trace_service_reply(struct xe_guc_relay *relay,
+				   struct relay_transaction *txn,
+				   int result, int send_result)
+{
+	struct xe_sriov_pf_reply_trace meta = {
+		.id = txn->rid,
+		.vfid = txn->remote,
+		.ctb = true,
+		.result = result,
+		.send_result = send_result,
+	};
+
+	if (!trace_xe_sriov_pf_service_reply_enabled() || !IS_SRIOV_PF(relay_to_xe(relay)))
+		return;
+	meta.action = FIELD_GET(GUC_HXG_REQUEST_MSG_0_ACTION, txn->request_buf[txn->offset]);
+	if (meta.action != GUC_RELAY_ACTION_VF2PF_HANDSHAKE &&
+	    meta.action != GUC_RELAY_ACTION_VF2PF_QUERY_RUNTIME)
+		return;
+
+	trace_xe_sriov_pf_service_reply(relay_to_gt(relay), &meta,
+				      txn->request_buf + txn->offset, txn->request_len,
+				      txn->response_buf + txn->offset, txn->response_len);
+}
+
 static void relay_process_incoming_action(struct xe_guc_relay *relay)
 {
 	struct relay_transaction *txn;
 	bool again = false;
 	u32 type;
-	int ret;
+	int ret, service_result;
 
 	txn = relay_dequeue_transaction(relay);
 	if (!txn)
@@ -732,11 +761,18 @@ static void relay_process_incoming_action(struct xe_guc_relay *relay)
 
 	type = FIELD_GET(GUC_HXG_MSG_0_TYPE, txn->request_buf[txn->offset]);
 
+	trace_xe_sriov_relay(relay_to_gt(relay), txn->remote, txn->rid,
+		FIELD_GET(GUC_HXG_REQUEST_MSG_0_ACTION, txn->request_buf[txn->offset]),
+		XE_SRIOV_TRACE_RELAY_HANDLE, 0);
 	ret = relay_action_handler(relay, txn->remote,
 				   txn->request_buf + txn->offset, txn->request_len,
 				   txn->response_buf + txn->offset,
 				   ARRAY_SIZE(txn->response_buf) - txn->offset);
 
+	trace_xe_sriov_relay(relay_to_gt(relay), txn->remote, txn->rid,
+		FIELD_GET(GUC_HXG_REQUEST_MSG_0_ACTION, txn->request_buf[txn->offset]),
+		XE_SRIOV_TRACE_RELAY_RESULT, ret);
+	service_result = ret > 0 ? 0 : ret;
 	if (ret == -EINPROGRESS) {
 		again = true;
 		ret = guc_hxg_msg_encode_busy(txn->response_buf + txn->offset, 0);
@@ -745,6 +781,7 @@ static void relay_process_incoming_action(struct xe_guc_relay *relay)
 	if (ret > 0) {
 		txn->response_len = ret;
 		ret = relay_send_transaction(relay, txn);
+		pf_trace_service_reply(relay, txn, service_result, ret);
 	}
 
 	if (ret < 0) {
@@ -760,6 +797,7 @@ static void relay_process_incoming_action(struct xe_guc_relay *relay)
 							txn->remote ?
 							sanitize_relay_error_hint(-ret) : -ret);
 		ret = relay_send_transaction(relay, txn);
+		pf_trace_service_reply(relay, txn, service_result, ret);
 		again = false;
 	}
 
@@ -814,6 +852,9 @@ static int relay_queue_action_msg(struct xe_guc_relay *relay, u32 origin, u32 ri
 	txn = relay_new_incoming_transaction(relay, origin, rid, msg, len);
 	if (IS_ERR(txn))
 		return PTR_ERR(txn);
+	trace_xe_sriov_relay(relay_to_gt(relay), origin, rid,
+		FIELD_GET(GUC_HXG_REQUEST_MSG_0_ACTION, msg[0]),
+		XE_SRIOV_TRACE_RELAY_RECEIVE, 0);
 
 	spin_lock(&relay->lock);
 	list_add_tail(&txn->link, &relay->incoming_actions);

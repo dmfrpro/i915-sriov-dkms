@@ -20,6 +20,7 @@
 #include "xe_sched_job.h"
 #include "xe_tlb_inval_types.h"
 #include "xe_vm.h"
+#include "xe_sriov_trace_types.h"
 
 #define __dev_name_xe(xe)	dev_name((xe)->drm.dev)
 #define __dev_name_tile(tile)	__dev_name_xe(tile_to_xe((tile)))
@@ -34,16 +35,37 @@ DECLARE_EVENT_CLASS(xe_tlb_inval_fence,
 			     __string(dev, __dev_name_xe(xe))
 			     __field(struct xe_tlb_inval_fence *, fence)
 			     __field(int, seqno)
+			     __field(u8, gt)
+			     __field(u8, origin_gt)
+			     __field(u32, vfid)
+			     __field(u64, txn)
+			     __field(u32, op)
+			     __field(u32, asid)
+			     __field(u64, start)
+			     __field(u64, end)
+			     __field(int, error)
 			     ),
 
 		    TP_fast_assign(
 			   __assign_str(dev);
 			   __entry->fence = fence;
 			   __entry->seqno = fence->seqno;
+			   __entry->gt = fence->tlb_inval->trace_gt_id;
+			   __entry->origin_gt = fence->trace_origin_gt;
+			   __entry->vfid = fence->trace_vfid;
+			   __entry->txn = fence->trace_id;
+			   __entry->op = fence->trace_op;
+			   __entry->asid = fence->trace_asid;
+			   __entry->start = fence->trace_start;
+			   __entry->end = fence->trace_end;
+			   __entry->error = fence->base.error;
 			   ),
 
-		    TP_printk("dev=%s, fence=%p, seqno=%d",
-			      __get_str(dev), __entry->fence, __entry->seqno)
+		    TP_printk("dev=%s fence=%p seqno=%d gt=%u origin_gt=%u vfid=%u txn=%llu op=%u asid=%u start=%#llx end=%#llx error=%d",
+			      __get_str(dev), __entry->fence, __entry->seqno, __entry->gt,
+			      __entry->origin_gt, __entry->vfid, __entry->txn, __entry->op,
+			      __entry->asid,
+			      __entry->start, __entry->end, __entry->error)
 );
 
 DEFINE_EVENT(xe_tlb_inval_fence, xe_tlb_inval_fence_send,
@@ -64,6 +86,300 @@ DEFINE_EVENT(xe_tlb_inval_fence, xe_tlb_inval_fence_signal,
 DEFINE_EVENT(xe_tlb_inval_fence, xe_tlb_inval_fence_timeout,
 	     TP_PROTO(struct xe_device *xe, struct xe_tlb_inval_fence *fence),
 	     TP_ARGS(xe, fence)
+);
+
+TRACE_EVENT(xe_sriov_ggtt_assign,
+	TP_PROTO(struct xe_gt *gt, u16 vfid, u64 start, u64 size, bool gpu,
+		 bool done, u32 completed, int result),
+	TP_ARGS(gt, vfid, start, size, gpu, done, completed, result),
+	TP_STRUCT__entry(
+		__string(dev, __dev_name_gt(gt))
+		__field(u8, gt)
+		__field(u16, vfid)
+		__field(u64, start)
+		__field(u64, size)
+		__field(bool, gpu)
+		__field(bool, done)
+		__field(u32, completed)
+		__field(int, result)
+	),
+	TP_fast_assign(
+		__assign_str(dev);
+		__entry->gt = gt->info.id;
+		__entry->vfid = vfid;
+		__entry->start = start;
+		__entry->size = size;
+		__entry->gpu = gpu;
+		__entry->done = done;
+		__entry->completed = completed;
+		__entry->result = result;
+	),
+	TP_printk("dev=%s gt=%u vfid=%u start=%#llx size=%#llx gpu=%u done=%u completed=%u result=%d",
+		  __get_str(dev), __entry->gt, __entry->vfid, __entry->start,
+		  __entry->size, __entry->gpu, __entry->done, __entry->completed,
+		  __entry->result)
+);
+
+TRACE_EVENT(xe_sriov_vf_request,
+	TP_PROTO(struct xe_gt *gt, const struct xe_sriov_vf_trace *trace,
+		 enum xe_sriov_trace_phase phase, int result, u64 context, u64 seqno),
+	TP_ARGS(gt, trace, phase, result, context, seqno),
+	TP_STRUCT__entry(
+		__string(dev, __dev_name_gt(gt))
+		__field(u8, gt)
+		__field(u32, vfid)
+		__field(u64, txn)
+		__field(u32, opcode)
+		__field(u32, token)
+		__field(u32, offset)
+		__field(u32, count)
+		__field(u16, copies)
+		__field(u8, mode)
+		__field(bool, ctb)
+		__field(int, generation)
+		__field(int, epoch)
+		__field(int, primary_epoch)
+		__field(u32, phase)
+		__field(int, result)
+		__field(u64, context)
+		__field(u64, seqno)
+	),
+	TP_fast_assign(
+		__assign_str(dev);
+		__entry->gt = gt->info.id;
+		__entry->vfid = trace->vfid;
+		__entry->txn = trace->id;
+		__entry->opcode = trace->opcode;
+		__entry->token = trace->token;
+		__entry->offset = trace->offset;
+		__entry->count = trace->count;
+		__entry->copies = trace->copies;
+		__entry->mode = trace->mode;
+		__entry->ctb = trace->ctb;
+		__entry->generation = trace->generation;
+		__entry->epoch = trace->epoch;
+		__entry->primary_epoch = trace->primary_epoch;
+		__entry->phase = phase;
+		__entry->result = result;
+		__entry->context = context;
+		__entry->seqno = seqno;
+	),
+	TP_printk("dev=%s gt=%u vfid=%u txn=%llu ctb=%u opcode=%#x token=%#x phase=%u offset=%#x count=%u copies=%u mode=%u generation=%d epoch=%d primary_epoch=%d result=%d context=%llu seqno=%llu",
+		  __get_str(dev), __entry->gt, __entry->vfid, __entry->txn,
+		  __entry->ctb, __entry->opcode, __entry->token, __entry->phase,
+		  __entry->offset, __entry->count, __entry->copies, __entry->mode,
+		  __entry->generation, __entry->epoch, __entry->primary_epoch,
+		  __entry->result, __entry->context, __entry->seqno)
+);
+
+TRACE_EVENT(xe_sriov_relay,
+	TP_PROTO(struct xe_gt *gt, u32 vfid, u32 rid, u32 action,
+		 enum xe_sriov_trace_phase phase, int result),
+	TP_ARGS(gt, vfid, rid, action, phase, result),
+	TP_STRUCT__entry(
+		__string(dev, __dev_name_gt(gt))
+		__field(u8, gt)
+		__field(u32, vfid)
+		__field(u32, rid)
+		__field(u32, action)
+		__field(u32, phase)
+		__field(int, result)
+	),
+	TP_fast_assign(
+		__assign_str(dev);
+		__entry->gt = gt->info.id;
+		__entry->vfid = vfid;
+		__entry->rid = rid;
+		__entry->action = action;
+		__entry->phase = phase;
+		__entry->result = result;
+	),
+	TP_printk("dev=%s gt=%u vfid=%u rid=%u action=%#x phase=%u result=%d",
+		  __get_str(dev), __entry->gt, __entry->vfid, __entry->rid,
+		  __entry->action, __entry->phase, __entry->result)
+);
+
+TRACE_EVENT(xe_sriov_guc_params,
+	TP_PROTO(struct xe_gt *gt, u32 wa, u32 feature, u32 ads),
+	TP_ARGS(gt, wa, feature, ads),
+	TP_STRUCT__entry(
+		__string(dev, __dev_name_gt(gt))
+		__field(u8, gt)
+		__field(u32, wa)
+		__field(u32, feature)
+		__field(u32, ads)
+	),
+	TP_fast_assign(
+		__assign_str(dev);
+		__entry->gt = gt->info.id;
+		__entry->wa = wa;
+		__entry->feature = feature;
+		__entry->ads = ads;
+	),
+	TP_printk("dev=%s gt=%u wa=%#x feature=%#x ads=%#x",
+		  __get_str(dev), __entry->gt, __entry->wa,
+		  __entry->feature, __entry->ads)
+);
+
+TRACE_EVENT(xe_sriov_pf_wa_klv,
+	TP_PROTO(struct xe_gt *gt, u32 key, const u32 *data, u32 len, int result),
+	TP_ARGS(gt, key, data, len, result),
+	TP_STRUCT__entry(
+		__string(dev, __dev_name_gt(gt))
+		__field(u8, gt)
+		__field(u32, key)
+		__field(u32, len)
+		__field(u32, copied)
+		__field(int, result)
+		__array(u32, data, 16)
+	),
+	TP_fast_assign(
+		__assign_str(dev);
+		__entry->gt = gt->info.id;
+		__entry->key = key;
+		__entry->len = len;
+		__entry->copied = min_t(u32, len, 16);
+		__entry->result = result;
+		memset(__entry->data, 0, sizeof(__entry->data));
+		if (__entry->copied)
+			memcpy(__entry->data, data, __entry->copied * sizeof(u32));
+	),
+	TP_printk("dev=%s gt=%u key=%#x len=%u copied=%u result=%d data=%s",
+		  __get_str(dev), __entry->gt, __entry->key, __entry->len,
+		  __entry->copied, __entry->result,
+		  __print_array(__entry->data, __entry->copied, sizeof(u32)))
+);
+
+TRACE_EVENT(xe_sriov_pf_guc_event,
+	TP_PROTO(struct xe_gt *gt, u32 action, bool handled, int result,
+		 const u32 *msg, u32 len),
+	TP_ARGS(gt, action, handled, result, msg, len),
+	TP_STRUCT__entry(
+		__string(dev, __dev_name_gt(gt))
+		__field(u8, gt)
+		__field(u32, action)
+		__field(bool, handled)
+		__field(int, result)
+		__field(u32, len)
+		__field(u32, copied)
+		__array(u32, msg, 16)
+	),
+	TP_fast_assign(
+		__assign_str(dev);
+		__entry->gt = gt->info.id;
+		__entry->action = action;
+		__entry->handled = handled;
+		__entry->result = result;
+		__entry->len = len;
+		__entry->copied = min_t(u32, len, 16);
+		memset(__entry->msg, 0, sizeof(__entry->msg));
+		if (__entry->copied)
+			memcpy(__entry->msg, msg, __entry->copied * sizeof(u32));
+	),
+	TP_printk("dev=%s gt=%u action=%#x handled=%u result=%d len=%u copied=%u msg=%s",
+		  __get_str(dev), __entry->gt, __entry->action, __entry->handled,
+		  __entry->result, __entry->len, __entry->copied,
+		  __print_array(__entry->msg, __entry->copied, sizeof(u32)))
+);
+
+TRACE_EVENT(xe_sriov_pf_vf_state,
+	TP_PROTO(struct xe_gt *gt, u32 vfid, u32 bit, bool enter, unsigned long state),
+	TP_ARGS(gt, vfid, bit, enter, state),
+	TP_STRUCT__entry(
+		__string(dev, __dev_name_gt(gt))
+		__field(u8, gt)
+		__field(u32, vfid)
+		__field(u32, bit)
+		__field(bool, enter)
+		__field(unsigned long, state)
+	),
+	TP_fast_assign(
+		__assign_str(dev);
+		__entry->gt = gt->info.id;
+		__entry->vfid = vfid;
+		__entry->bit = bit;
+		__entry->enter = enter;
+		__entry->state = state;
+	),
+	TP_printk("dev=%s gt=%u vfid=%u bit=%u enter=%u state=%#lx",
+		  __get_str(dev), __entry->gt, __entry->vfid, __entry->bit,
+		  __entry->enter, __entry->state)
+);
+
+TRACE_EVENT(xe_sriov_pf_adverse,
+	TP_PROTO(struct xe_gt *gt, u32 vfid, u32 key, u32 threshold, int result),
+	TP_ARGS(gt, vfid, key, threshold, result),
+	TP_STRUCT__entry(
+		__string(dev, __dev_name_gt(gt))
+		__field(u8, gt)
+		__field(u32, vfid)
+		__field(u32, key)
+		__field(u32, threshold)
+		__field(int, result)
+	),
+	TP_fast_assign(
+		__assign_str(dev);
+		__entry->gt = gt->info.id;
+		__entry->vfid = vfid;
+		__entry->key = key;
+		__entry->threshold = threshold;
+		__entry->result = result;
+	),
+	TP_printk("dev=%s gt=%u vfid=%u key=%#x threshold=%u result=%d",
+		  __get_str(dev), __entry->gt, __entry->vfid, __entry->key,
+		  __entry->threshold, __entry->result)
+);
+
+TRACE_EVENT(xe_sriov_pf_service_reply,
+	TP_PROTO(struct xe_gt *gt, const struct xe_sriov_pf_reply_trace *meta,
+		 const u32 *request, u32 request_len, const u32 *reply, u32 reply_len),
+	TP_ARGS(gt, meta, request, request_len, reply, reply_len),
+	TP_STRUCT__entry(
+		__string(dev, __dev_name_gt(gt))
+		__field(u8, gt)
+		__field(u64, id)
+		__field(u32, vfid)
+		__field(u32, token)
+		__field(u32, action)
+		__field(bool, ctb)
+		__field(int, result)
+		__field(int, send_result)
+		__field(u32, request_len)
+		__field(u32, request_copied)
+		__field(u32, reply_len)
+		__field(u32, reply_copied)
+		__array(u32, request, 8)
+		__array(u32, reply, 64)
+	),
+	TP_fast_assign(
+		__assign_str(dev);
+		__entry->gt = gt->info.id;
+		__entry->id = meta->id;
+		__entry->vfid = meta->vfid;
+		__entry->token = meta->token;
+		__entry->action = meta->action;
+		__entry->ctb = meta->ctb;
+		__entry->result = meta->result;
+		__entry->send_result = meta->send_result;
+		__entry->request_len = request_len;
+		__entry->request_copied = min_t(u32, request_len, 8);
+		__entry->reply_len = reply_len;
+		__entry->reply_copied = min_t(u32, reply_len, 64);
+		memset(__entry->request, 0, sizeof(__entry->request));
+		memset(__entry->reply, 0, sizeof(__entry->reply));
+		if (__entry->request_copied)
+			memcpy(__entry->request, request,
+			       __entry->request_copied * sizeof(u32));
+		if (__entry->reply_copied)
+			memcpy(__entry->reply, reply, __entry->reply_copied * sizeof(u32));
+	),
+	TP_printk("dev=%s gt=%u vfid=%u ctb=%u id=%llu token=%#x action=%#x result=%d send_result=%d request_len=%u request_copied=%u reply_len=%u reply_copied=%u request=%s reply=%s",
+		  __get_str(dev), __entry->gt, __entry->vfid, __entry->ctb,
+		  __entry->id, __entry->token, __entry->action, __entry->result,
+		  __entry->send_result, __entry->request_len, __entry->request_copied,
+		  __entry->reply_len, __entry->reply_copied,
+		  __print_array(__entry->request, __entry->request_copied, sizeof(u32)),
+		  __print_array(__entry->reply, __entry->reply_copied, sizeof(u32)))
 );
 
 DECLARE_EVENT_CLASS(xe_exec_queue,

@@ -13,6 +13,7 @@
 #include "xe_gt_sriov_pf_config.h"
 #include "xe_gt_sriov_pf_control.h"
 #include "xe_gt_sriov_pf_helpers.h"
+#include "xe_gt_sriov_pf_service.h"
 #include "xe_gt_sriov_pf_migration.h"
 #include "xe_gt_sriov_pf_monitor.h"
 #include "xe_gt_sriov_printk.h"
@@ -24,6 +25,7 @@
 #include "xe_sriov_pf_migration.h"
 #include "xe_sriov_pf_service.h"
 #include "xe_tile.h"
+#include "xe_trace.h"
 
 static const char *control_cmd_to_string(u32 cmd)
 {
@@ -302,6 +304,9 @@ static bool pf_enter_vf_state(struct xe_gt *gt, unsigned int vfid,
 			      enum xe_gt_sriov_control_bits bit)
 {
 	if (!test_and_set_bit(bit, pf_peek_vf_state(gt, vfid))) {
+		if (trace_xe_sriov_pf_vf_state_enabled())
+			trace_xe_sriov_pf_vf_state(gt, vfid, bit, true,
+						 READ_ONCE(*pf_peek_vf_state(gt, vfid)));
 		pf_track_vf_state(gt, vfid, bit, "enter");
 		return true;
 	}
@@ -312,6 +317,9 @@ static bool pf_exit_vf_state(struct xe_gt *gt, unsigned int vfid,
 			     enum xe_gt_sriov_control_bits bit)
 {
 	if (test_and_clear_bit(bit, pf_peek_vf_state(gt, vfid))) {
+		if (trace_xe_sriov_pf_vf_state_enabled())
+			trace_xe_sriov_pf_vf_state(gt, vfid, bit, false,
+						 READ_ONCE(*pf_peek_vf_state(gt, vfid)));
 		pf_track_vf_state(gt, vfid, bit, "exit");
 		return true;
 	}
@@ -1557,9 +1565,15 @@ static bool pf_enter_vf_flr_wip(struct xe_gt *gt, unsigned int vfid)
 {
 	if (!pf_enter_vf_state(gt, vfid, XE_GT_SRIOV_STATE_FLR_WIP))
 		return false;
+	xe_gt_sriov_pf_service_reset_mmio_vf(gt, vfid);
 
 	pf_enter_vf_wip(gt, vfid);
 	return true;
+}
+
+bool xe_gt_sriov_pf_control_flr_in_progress(struct xe_gt *gt, u32 vfid)
+{
+	return pf_check_vf_state(gt, vfid, XE_GT_SRIOV_STATE_FLR_WIP);
 }
 
 static void pf_exit_vf_flr_wip(struct xe_gt *gt, unsigned int vfid)

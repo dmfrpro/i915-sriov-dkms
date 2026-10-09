@@ -18,6 +18,7 @@
 #include "xe_gt.h"
 #include "xe_gt_sriov_pf_config.h"
 #include "xe_gt_sriov_pf_helpers.h"
+#include "xe_gt_sriov_pf_service.h"
 #include "xe_gt_sriov_pf_policy.h"
 #include "xe_gt_sriov_printk.h"
 #include "xe_guc.h"
@@ -514,6 +515,8 @@ static int pf_provision_vf_ggtt(struct xe_gt *gt, unsigned int vfid, u64 size)
 	xe_gt_assert(gt, IS_SRIOV_PF(gt_to_xe(gt)));
 
 	size = round_up(size, alignment);
+	if (xe_gt_sriov_pf_service_mmio_busy(gt, vfid))
+		return -EBUSY;
 
 	if (config->ggtt_region) {
 		err = pf_distribute_config_ggtt(tile, vfid, 0, 0);
@@ -535,7 +538,9 @@ static int pf_provision_vf_ggtt(struct xe_gt *gt, unsigned int vfid, u64 size)
 	if (IS_ERR(node))
 		return PTR_ERR(node);
 
-	xe_ggtt_assign(node, vfid);
+	err = xe_ggtt_assign(node, vfid);
+	if (err)
+		goto err;
 	xe_gt_sriov_dbg_verbose(gt, "VF%u assigned GGTT %llx-%llx\n",
 				vfid, xe_ggtt_node_addr(node), xe_ggtt_node_addr(node) + size - 1);
 
@@ -2878,7 +2883,12 @@ int xe_gt_sriov_pf_config_release(struct xe_gt *gt, unsigned int vfid, bool forc
 
 	xe_gt_assert(gt, vfid);
 
+	xe_gt_sriov_pf_service_flush_mmio_vf(gt, vfid);
 	mutex_lock(xe_gt_sriov_pf_master_mutex(gt));
+	if (xe_gt_sriov_pf_service_mmio_busy(gt, vfid)) {
+		mutex_unlock(xe_gt_sriov_pf_master_mutex(gt));
+		return -EBUSY;
+	}
 	err = pf_send_vf_cfg_reset(gt, vfid);
 	if (!err || force)
 		pf_release_vf_config(gt, vfid);
@@ -2893,10 +2903,9 @@ int xe_gt_sriov_pf_config_release(struct xe_gt *gt, unsigned int vfid, bool forc
 	return force ? 0 : err;
 }
 
-static void pf_sanitize_ggtt(struct xe_ggtt_node *ggtt_region, unsigned int vfid)
+static int pf_sanitize_ggtt(struct xe_ggtt_node *ggtt_region, unsigned int vfid)
 {
-	if (ggtt_region)
-		xe_ggtt_assign(ggtt_region, vfid);
+	return ggtt_region ? xe_ggtt_assign(ggtt_region, vfid) : 0;
 }
 
 static int pf_sanitize_lmem(struct xe_tile *tile, struct xe_bo *bo, long timeout)
@@ -2940,8 +2949,8 @@ static int pf_sanitize_vf_resources(struct xe_gt *gt, u32 vfid, long timeout)
 	 * GuC doorbell IDs and context IDs do not need any clearing.
 	 */
 	if (xe_gt_is_main_type(gt)) {
-		pf_sanitize_ggtt(config->ggtt_region, vfid);
-		if (IS_DGFX(xe))
+		err = pf_sanitize_ggtt(config->ggtt_region, vfid);
+		if (!err && IS_DGFX(xe))
 			err = pf_sanitize_lmem(tile, config->lmem_obj, timeout);
 	}
 
@@ -2964,6 +2973,7 @@ int xe_gt_sriov_pf_config_sanitize(struct xe_gt *gt, unsigned int vfid, long tim
 
 	xe_gt_assert(gt, vfid != PFID);
 
+	xe_gt_sriov_pf_service_flush_mmio_vf(gt, vfid);
 	mutex_lock(xe_gt_sriov_pf_master_mutex(gt));
 	err = pf_sanitize_vf_resources(gt, vfid, timeout);
 	mutex_unlock(xe_gt_sriov_pf_master_mutex(gt));

@@ -12,6 +12,7 @@
 #include "xe_gt_sriov_printk.h"
 #include "xe_guc_klv_helpers.h"
 #include "xe_guc_klv_thresholds_set.h"
+#include "xe_trace.h"
 
 /**
  * xe_gt_sriov_pf_monitor_flr - Cleanup VF data after VF FLR.
@@ -51,6 +52,7 @@ static int pf_handle_vf_threshold_event(struct xe_gt *gt, u32 vfid, u32 threshol
 
 	/* was there a new KEY added that we missed? */
 	if (unlikely(e < 0)) {
+		trace_xe_sriov_pf_adverse(gt, vfid, threshold, 0, -ENOTCONN);
 		xe_gt_sriov_notice(gt, "unknown threshold key %#x reported for %s\n",
 				   threshold, origin);
 		return -ENOTCONN;
@@ -61,6 +63,9 @@ static int pf_handle_vf_threshold_event(struct xe_gt *gt, u32 vfid, u32 threshol
 			xe_guc_klv_key_to_string(threshold));
 
 	pf_update_event_counter(gt, vfid, e);
+	if (trace_xe_sriov_pf_adverse_enabled())
+		trace_xe_sriov_pf_adverse(gt, vfid, threshold,
+					 xe_gt_sriov_pf_config_get_threshold(gt, vfid, e), 0);
 
 	return 0;
 }

@@ -4,6 +4,7 @@
  */
 
 #include "xe_ggtt.h"
+#include "abi/guc_ggtt_relay_abi.h"
 
 #include <kunit/visibility.h>
 #include <linux/fault-inject.h>
@@ -24,6 +25,8 @@
 #include "xe_gt_types.h"
 #include "xe_map.h"
 #include "xe_mmio.h"
+#include "xe_migrate.h"
+#include "xe_module.h"
 #include "xe_pat.h"
 #include "xe_pm.h"
 #include "xe_res_cursor.h"
@@ -31,6 +34,7 @@
 #include "xe_tile_printk.h"
 #include "xe_tile_sriov_vf.h"
 #include "xe_tlb_inval.h"
+#include "xe_trace.h"
 #include "xe_wa.h"
 #include "xe_wopcm.h"
 
@@ -940,6 +944,72 @@ u64 xe_ggtt_largest_hole(struct xe_ggtt *ggtt, u64 alignment, u64 *spare)
 }
 
 #ifdef CONFIG_PCI_IOV
+struct dma_fence *xe_ggtt_update_vf(struct xe_ggtt_node *node, u16 vfid,
+				 u32 offset, u8 mode, u16 copies, u64 pte)
+{
+	return xe_ggtt_update_vf_ptes(node, vfid, offset, mode, copies, &pte, 1);
+}
+
+struct dma_fence *xe_ggtt_update_vf_ptes(struct xe_ggtt_node *node, u16 vfid,
+				      u32 offset, u8 mode, u16 copies,
+				      const u64 *input, u32 count)
+{
+	const u64 addr_mask = GENMASK_ULL(45, 12);
+	const u64 pat_mask = XELPG_GGTT_PTE_PAT0 | XELPG_GGTT_PTE_PAT1;
+	struct xe_ggtt *ggtt = node->ggtt;
+	u32 total = count + copies, i, j = 0, selected;
+	u64 start = xe_ggtt_node_addr(node), size = xe_ggtt_node_size(node);
+	u64 relative = (u64)offset * XE_PAGE_SIZE, addr, flags;
+	struct dma_fence *fence;
+	u64 *ptes;
+
+	if (!vfid || !FIELD_FIT(GGTT_PTE_VFID, vfid) || mode > 3 || copies > 1023 ||
+	    !count || count > VF2PF_GGTT_REQUEST_MAX_PTES)
+		return ERR_PTR(-EINVAL);
+	if (relative > size || (u64)total * XE_PAGE_SIZE > size - relative ||
+	    start + relative + (u64)total * XE_PAGE_SIZE > GUC_GGTT_TOP)
+		return ERR_PTR(-ERANGE);
+	/* Validate every input before submitting any partial update. */
+	for (i = 0; i < count; i++)
+		if (!(input[i] & XE_PAGE_PRESENT) ||
+		    (input[i] & ~(addr_mask | pat_mask | GGTT_PTE_VFID | XE_PAGE_PRESENT)))
+			return ERR_PTR(-EINVAL);
+	selected = (mode & 2) ? count - 1 : 0;
+	addr = input[selected] & addr_mask;
+	if ((mode & 1) && addr + (u64)copies * XE_PAGE_SIZE > addr_mask)
+		return ERR_PTR(-ERANGE);
+
+	ptes = kmalloc_array(total, sizeof(*ptes), GFP_KERNEL);
+	if (!ptes)
+		return ERR_PTR(-ENOMEM);
+	for (i = 0; i < count; i++) {
+		addr = input[i] & addr_mask;
+		flags = (input[i] & pat_mask) | FIELD_PREP(GGTT_PTE_VFID, vfid) |
+			XE_PAGE_PRESENT;
+		ptes[j++] = flags | addr;
+		if (i == selected)
+			for (u32 n = 1; n <= copies; n++)
+				ptes[j++] = flags | (addr + ((mode & 1) ?
+							   (u64)n * XE_PAGE_SIZE : 0));
+	}
+
+	/* Caller pins the VF configuration via the outstanding transaction flag. */
+	fence = xe_migrate_update_ggtt(ggtt->tile->migrate, start + relative, ptes, total);
+	kfree(ptes);
+	return fence;
+}
+
+int xe_ggtt_invalidate_vf(struct xe_ggtt *ggtt, const struct xe_sriov_vf_trace *trace)
+{
+	int err;
+
+	xe_mmio_read32(xe_root_tile_mmio(tile_to_xe(ggtt->tile)), VF_CAP_REG);
+	err = xe_tlb_inval_ggtt_vf(&ggtt->tile->primary_gt->tlb_inval, trace);
+	if (!err && ggtt->tile->media_gt)
+		err = xe_tlb_inval_ggtt_vf(&ggtt->tile->media_gt->tlb_inval, trace);
+	return err;
+}
+
 static u64 xe_encode_vfid_pte(u16 vfid)
 {
 	return FIELD_PREP(GGTT_PTE_VFID, vfid) | XE_PAGE_PRESENT;
@@ -963,6 +1033,70 @@ static void xe_ggtt_assign_locked(const struct xe_ggtt_node *node, u16 vfid)
 	xe_ggtt_invalidate(ggtt);
 }
 
+/*
+ * i915 uses its GPU binder to assign VF ownership on Media 13. Keep the
+ * existing PTE contents (owner, present, physical address zero), but test the
+ * same command-streamer path instead of CPU stores on MTL/ARL. This also
+ * covers sanitizing the VF region after FLR; it is not a texture flush.
+ */
+static int xe_ggtt_assign_gpu(const struct xe_ggtt_node *node, u16 vfid,
+			    u32 *completed)
+{
+	struct xe_ggtt *ggtt = node->ggtt;
+	struct xe_gt *gt = ggtt->tile->primary_gt;
+	u64 start = xe_ggtt_node_addr(node);
+	u32 count = xe_ggtt_node_size(node) / XE_PAGE_SIZE;
+	struct xe_sriov_vf_trace trace = {
+		.vfid = vfid,
+		.gt_id = gt->info.id,
+		.offset = start / XE_PAGE_SIZE,
+		.count = count,
+	};
+	struct dma_fence *fence;
+	u64 *ptes;
+	u32 n;
+	int err = 0;
+
+	if (!ggtt->tile->migrate)
+		return -ENODEV;
+
+	/* Match the i915 binder's limit and fence each chunk before reusing it. */
+	ptes = kmalloc_array(511, sizeof(*ptes), GFP_KERNEL);
+	if (!ptes)
+		return -ENOMEM;
+	memset64(ptes, xe_encode_vfid_pte(vfid), 511);
+
+	while (*completed < count) {
+		n = min_t(u32, 511, count - *completed);
+		fence = xe_migrate_update_ggtt(ggtt->tile->migrate,
+					     start + (u64)*completed * XE_PAGE_SIZE,
+					     ptes, n);
+		if (IS_ERR(fence)) {
+			err = PTR_ERR(fence);
+			break;
+		}
+
+		/*
+		 * Do not release/reuse this GGTT node while its writer is pending.
+		 * The scheduler handles hung jobs and signals their error fences.
+		 */
+		err = dma_fence_wait(fence, false);
+		if (!err) {
+			err = dma_fence_get_status(fence);
+			err = err > 0 ? 0 : err ?: -EIO;
+		}
+		dma_fence_put(fence);
+		if (err)
+			break;
+		*completed += n;
+	}
+	kfree(ptes);
+
+	if (!err)
+		err = xe_ggtt_invalidate_vf(ggtt, &trace);
+	return err;
+}
+
 /**
  * xe_ggtt_assign - assign a GGTT region to the VF
  * @node: the &xe_ggtt_node to update
@@ -971,11 +1105,47 @@ static void xe_ggtt_assign_locked(const struct xe_ggtt_node *node, u16 vfid)
  * This function is used by the PF driver to assign a GGTT region to the VF.
  * In addition to PTE's VFID bits 11:2 also PRESENT bit 0 is set as on some
  * platforms VFs can't modify that either.
+ *
+ * Return: 0 on success, or an error before the region is published to GuC.
  */
-void xe_ggtt_assign(const struct xe_ggtt_node *node, u16 vfid)
+int xe_ggtt_assign(const struct xe_ggtt_node *node, u16 vfid)
 {
-	guard(mutex)(&node->ggtt->lock);
-	xe_ggtt_assign_locked(node, vfid);
+	struct xe_gt *gt = node->ggtt->tile->primary_gt;
+	struct xe_device *xe = gt_to_xe(gt);
+	u64 start = xe_ggtt_node_addr(node);
+	u64 size = xe_ggtt_node_size(node);
+	bool gpu = xe_modparam.mtl_sriov_gpu_assign && IS_SRIOV_PF(xe) &&
+		   GRAPHICS_VERx100(xe) >= 1270 && GRAPHICS_VERx100(xe) <= 1274 &&
+		   MEDIA_VER(xe) == 13;
+	u32 completed = 0;
+	int err = 0;
+
+	if (!vfid || !FIELD_FIT(GGTT_PTE_VFID, vfid) || !size ||
+	    !IS_ALIGNED(start, XE_PAGE_SIZE) || !IS_ALIGNED(size, XE_PAGE_SIZE) ||
+	    start >= GUC_GGTT_TOP || size > GUC_GGTT_TOP - start)
+		return -EINVAL;
+
+	trace_xe_sriov_ggtt_assign(gt, vfid, start, size, gpu, false, 0, 0);
+	/*
+	 * Callers hold the PF configuration mutex and keep the node alive.
+	 * GPU waits must not hold the GGTT allocator mutex needed by recovery
+	 * and other PF allocations. The command-streamer service uses the same
+	 * lifetime discipline for VF updates.
+	 */
+	if (gpu)
+		err = xe_ggtt_assign_gpu(node, vfid, &completed);
+	else {
+		guard(mutex)(&node->ggtt->lock);
+
+		xe_ggtt_assign_locked(node, vfid);
+		completed = size / XE_PAGE_SIZE;
+	}
+	trace_xe_sriov_ggtt_assign(gt, vfid, start, size, gpu, true, completed, err);
+	if (gpu)
+		xe_gt_info(gt,
+			   "VF%u GGTT GPU owner assignment: start=%#llx size=%#llx completed=%u result=%d\n",
+			   vfid, start, size, completed, err);
+	return err;
 }
 
 /**

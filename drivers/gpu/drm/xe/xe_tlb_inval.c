@@ -87,8 +87,10 @@ static void xe_tlb_inval_fence_timeout(struct work_struct *work)
 
 		trace_xe_tlb_inval_fence_timeout(xe, fence);
 		drm_err(&xe->drm,
-			"TLB invalidation fence timeout, seqno=%d recv=%d",
-			fence->seqno, tlb_inval->seqno_recv);
+			"TLB invalidation timeout gt=%u origin_gt=%u vf=%u txn=%llu op=%u asid=%u seqno=%d recv=%d\n",
+			tlb_inval->trace_gt_id, fence->trace_origin_gt,
+			fence->trace_vfid, fence->trace_id,
+			fence->trace_op, fence->trace_asid, fence->seqno, tlb_inval->seqno_recv);
 
 		fence->base.error = -ETIME;
 		xe_tlb_inval_fence_signal(fence);
@@ -140,6 +142,7 @@ int xe_gt_tlb_inval_init_early(struct xe_gt *gt)
 	int err;
 
 	tlb_inval->xe = xe;
+	tlb_inval->trace_gt_id = gt->info.id;
 	tlb_inval->seqno = 1;
 	INIT_LIST_HEAD(&tlb_inval->pending_fences);
 	spin_lock_init(&tlb_inval->pending_lock);
@@ -297,6 +300,7 @@ static void xe_tlb_inval_fence_prep(struct xe_tlb_inval_fence *fence)
 int xe_tlb_inval_all(struct xe_tlb_inval *tlb_inval,
 		     struct xe_tlb_inval_fence *fence)
 {
+	fence->trace_op = XE_TLB_TRACE_ALL;
 	return xe_tlb_inval_issue(tlb_inval, fence, tlb_inval->ops->all);
 }
 
@@ -309,16 +313,38 @@ int xe_tlb_inval_all(struct xe_tlb_inval *tlb_inval,
  *
  * Return: 0 on success, negative error code on error
  */
-int xe_tlb_inval_ggtt(struct xe_tlb_inval *tlb_inval)
+static int tlb_inval_ggtt(struct xe_tlb_inval *tlb_inval,
+			  const struct xe_sriov_vf_trace *trace)
 {
 	struct xe_tlb_inval_fence fence, *fence_ptr = &fence;
 	int ret;
 
 	xe_tlb_inval_fence_init(tlb_inval, fence_ptr, true);
+	fence.trace_op = XE_TLB_TRACE_GGTT;
+	if (trace) {
+		fence.trace_origin_gt = trace->gt_id;
+		fence.trace_vfid = trace->vfid;
+		fence.trace_id = trace->id;
+	}
 	ret = xe_tlb_inval_issue(tlb_inval, fence_ptr, tlb_inval->ops->ggtt);
 	xe_tlb_inval_fence_wait(fence_ptr);
+	/* Do not acknowledge a VF mapping after a timed out invalidation. */
+	if (!ret && dma_fence_get_status(&fence_ptr->base) < 0)
+		ret = dma_fence_get_status(&fence_ptr->base);
 
 	return ret;
+}
+
+int xe_tlb_inval_ggtt(struct xe_tlb_inval *tlb_inval)
+{
+	return tlb_inval_ggtt(tlb_inval, NULL);
+}
+
+/* Same GGTT invalidation, with VF ownership copied into its fence. */
+int xe_tlb_inval_ggtt_vf(struct xe_tlb_inval *tlb_inval,
+			 const struct xe_sriov_vf_trace *trace)
+{
+	return tlb_inval_ggtt(tlb_inval, trace);
 }
 
 /**
@@ -341,6 +367,10 @@ int xe_tlb_inval_range(struct xe_tlb_inval *tlb_inval,
 		       struct xe_tlb_inval_fence *fence, u64 start, u64 end,
 		       u32 asid, struct drm_suballoc *prl_sa)
 {
+	fence->trace_op = XE_TLB_TRACE_RANGE;
+	fence->trace_asid = asid;
+	fence->trace_start = start;
+	fence->trace_end = end;
 	return xe_tlb_inval_issue(tlb_inval, fence, tlb_inval->ops->ppgtt,
 				  start, end, asid, prl_sa);
 }
@@ -467,6 +497,13 @@ void xe_tlb_inval_fence_init(struct xe_tlb_inval *tlb_inval,
 	else
 		dma_fence_get(&fence->base);
 	fence->tlb_inval = tlb_inval;
+	fence->trace_op = XE_TLB_TRACE_NONE;
+	fence->trace_origin_gt = tlb_inval->trace_gt_id;
+	fence->trace_vfid = 0;
+	fence->trace_id = 0;
+	fence->trace_asid = 0;
+	fence->trace_start = 0;
+	fence->trace_end = 0;
 }
 
 /**

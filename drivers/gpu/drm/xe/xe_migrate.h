@@ -165,6 +165,9 @@ struct dma_fence *xe_migrate_clear(struct xe_migrate *m,
 
 struct xe_vm *xe_migrate_get_vm(struct xe_migrate *m);
 
+struct dma_fence *xe_migrate_update_ggtt(struct xe_migrate *m, u32 offset,
+				     const u64 *ptes, u32 count);
+
 struct dma_fence *
 xe_migrate_update_pgtables(struct xe_migrate *m,
 			   struct xe_migrate_pt_update *pt_update);

@@ -12,6 +12,7 @@
 struct xe_gt;
 
 int xe_gt_sriov_pf_control_init(struct xe_gt *gt);
+bool xe_gt_sriov_pf_control_flr_in_progress(struct xe_gt *gt, u32 vfid);
 void xe_gt_sriov_pf_control_restart(struct xe_gt *gt);
 
 int xe_gt_sriov_pf_control_pause_vf(struct xe_gt *gt, unsigned int vfid);
